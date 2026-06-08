@@ -29,8 +29,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import traceback
 import json
 import argparse
+import os
+import httpx
 import sglang as sgl
 from agents import ReactAgent
+from dotenv import load_dotenv
+from openai import OpenAI
 from sglang.lang.chat_template import (ChatTemplate, get_chat_template,
                                        register_chat_template)
 from transformers import AutoTokenizer
@@ -71,28 +75,48 @@ def load_codellama_template(endpoint2):
     endpoint2.chat_template = get_chat_template("codellama")
 
 
+def resolve_backend(backend, model_name):
+    if backend != "auto":
+        return backend
+    return "openai" if "gpt" in model_name else "local"
+
+
+def default_env_file():
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(project_root, ".env")
+
+
 def main(args):
+    load_dotenv(args.env_file, override=True)
+    plan_backend = resolve_backend(args.plan_backend, args.plan_model_name)
+    code_backend = resolve_backend(args.code_backend, args.code_model_name)
     codeagent_endpoint = None
-    if not "gpt" in args.plan_model_name:
+    client = None
+    if plan_backend == "openai" or code_backend == "openai":
+        client = OpenAI(
+            api_key=args.api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=args.base_url or os.getenv("OPENAI_BASE_URL"),
+            http_client=httpx.Client()
+        )
+
+    if plan_backend == "local":
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_path)
         model = LLM(model=args.model_path)
-        if not "gpt" in args.code_model_name:
-            codeagent_endpoint = sgl.RuntimeEndpoint(
-                f"http://localhost:{args.code_endpoint}")
-            if "codellama" in args.code_model_name.lower():
-                load_codellama_template(codeagent_endpoint)
     else:
         model = None
         tokenizer = None
-        if "gpt" not in args.code_model_name:
-            codeagent_endpoint = sgl.RuntimeEndpoint(
-                f"http://localhost:{args.code_endpoint}")
-            if "codellama" in args.code_model_name.lower():
-                load_codellama_template(codeagent_endpoint)
+
+    if code_backend == "local":
+        codeagent_endpoint = sgl.RuntimeEndpoint(
+            f"http://localhost:{args.code_endpoint}")
+        if "codellama" in args.code_model_name.lower():
+            load_codellama_template(codeagent_endpoint)
 
     with open(args.dataset_path, "r") as f:
         table_dataset = [json.loads(line) for line in f]
+    if args.limit is not None:
+        table_dataset = table_dataset[:args.limit]
 
     trial = 0
     agent_cls = ReactAgent
@@ -122,6 +146,9 @@ def main(args):
         direct_reasoning=args.direct_reasoning,
         long_table_op=args.long_table_op,
         debugging=args.debugging,
+        client=client,
+        plan_backend=plan_backend,
+        code_backend=code_backend,
         code_as_observation=args.code_as_observation,
         without_tool=args.without_tool) for _, row in enumerate(table_dataset)]
     if args.debugging:
@@ -141,7 +168,7 @@ def main(args):
         finished_agents = []
         plan_model_name = args.plan_model_name.split("/")[-1].strip()
         code_model_name = args.code_model_name.split("/")[-1].strip()
-        output_path = f"{args.task}_{plan_model_name}_{code_model_name}_{args.as_reward}_{args.plan_sample}_{args.code_sample}_direct_{args.direct_reasoning}_{args.answer_aggregate}.json"
+        output_path = args.output_path or f"{args.task}_{plan_model_name}_{code_model_name}_{args.as_reward}_{args.plan_sample}_{args.code_sample}_direct_{args.direct_reasoning}_{args.answer_aggregate}.json"
         for idx, agent in enumerate([a for a in agents]):
             try:
                 finished_agent = write_to_file(
@@ -163,6 +190,18 @@ if __name__ == '__main__':
                         default="", help="name of the planning model.")
     parser.add_argument('--code_model_name',
                         default="", help="name of the coding model.")
+    parser.add_argument('--plan_backend', default="auto",
+                        choices=["auto", "openai", "local"],
+                        help="backend for the planning model.")
+    parser.add_argument('--code_backend', default="auto",
+                        choices=["auto", "openai", "local"],
+                        help="backend for the coding model.")
+    parser.add_argument('--api_key', default="",
+                        help="OpenAI-compatible API key. Falls back to OPENAI_API_KEY.")
+    parser.add_argument('--base_url', default="",
+                        help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL.")
+    parser.add_argument('--env_file', default=default_env_file(),
+                        help="env file containing OPENAI_API_KEY and OPENAI_BASE_URL.")
     parser.add_argument('--cache_dir', default="",
                         help="cache dir to load a model from.")
     parser.add_argument('--model_path', type=str,
@@ -171,6 +210,10 @@ if __name__ == '__main__':
                         default="../datasets/wtq.jsonl", help="dataset path.")
     parser.add_argument('--table_dir', type=str,
                         default="../datasets/databench/data", help="databench table directory")
+    parser.add_argument('--limit', type=int, default=None,
+                        help="only run the first N dataset examples.")
+    parser.add_argument('--output_path', type=str, default="",
+                        help="output JSONL path.")
     parser.add_argument('--max_step', type=int, default=6,
                         help="maximum number for valid iterations.")
     parser.add_argument('--max_actual_step', type=int, default=6,

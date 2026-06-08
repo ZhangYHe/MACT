@@ -30,8 +30,6 @@ import string
 from collections import Counter, OrderedDict, defaultdict
 
 import pandas as pd
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from dotenv import find_dotenv, load_dotenv
 from fewshots_table import (DEMO_CRT, DEMO_CRT_DIRECT, DEMO_SCITAB,
                             DEMO_SCITAB_DIRECT, DEMO_TAT, DEMO_TAT_DIRECT,
                             DEMO_WTQ, DEMO_WTQ_DIRECT,
@@ -42,7 +40,6 @@ from fewshots_table import (DEMO_CRT, DEMO_CRT_DIRECT, DEMO_SCITAB,
 from langchain import Wikipedia
 from langchain.agents.react.base import DocstoreExplorer
 from llm import OpenSourceLLM
-from openai import AzureOpenAI
 from prompts_table import (DIRECT_AGENT, NUMERICAL_OPERATION_PROMPT,
                            TABLE_OPERATION_PROMPT, react_agent_prompt_crt,
                            react_agent_prompt_scitab, react_agent_prompt_tat,
@@ -57,23 +54,7 @@ from utils import (extract_from_outputs, parse_action, table2df,
 all_input_token, all_output_token = 0, 0
 
 
-def load_gpt_azure():
-    _ = load_dotenv(find_dotenv())
-    token_provider = get_bearer_token_provider(
-        DefaultAzureCredential(
-            exclude_managed_identity_credential=True
-        ),
-    )
-    client = AzureOpenAI(
-        api_version="",
-        azure_ad_token_provider=token_provider,
-        azure_endpoint="")
-    return client
-
-# client = load_gpt_azure()
-
-
-def get_completion(prompt, client, n, model="gpt-35-turbo"):
+def get_completion(prompt, client, n, model):
     global all_input_token, all_output_token
     messages = [{"role": "user", "content": prompt}]
     response = client.chat.completions.create(
@@ -171,22 +152,23 @@ class ReactAgent:
                  without_tool=False,
                  long_table_op='ignore',
                  code_as_observation=False,
-                 debugging=False
+                 debugging=False,
+                 client=None,
+                 plan_backend='auto',
+                 code_backend='auto'
                  ) -> None:
 
         vllm = model
-        if "gpt" not in plan_model_name:
+        self.plan_backend = plan_backend
+        self.code_backend = code_backend
+        if self.plan_backend == "local":
             self.llm = OpenSourceLLM(
                 model_name=plan_model_name,
                 model=model,
                 vllm=vllm,
                 tokenizer=tokenizer
             )
-        if "gpt" in plan_model_name or "gpt" in code_model_name:
-            # self.client = load_gpt_azure()  too slow
-            self.client = client
-        else:
-            self.client = None
+        self.client = client
         self.tokenizer = tokenizer
         self.question = question
         self.table_string = table_linear(
@@ -298,7 +280,7 @@ class ReactAgent:
             prompt = TABLE_OPERATION_PROMPT.format(
                 instruction=instruction, table_df=self.table_df, examples=TABLE_OPERATION_EXAMPLE)
             messages = [{"role": "user", "content": prompt}]
-            if "gpt" not in self.code_model_name:
+            if self.code_backend == "local":
                 codes = self.llm(
                     messages, num_return_sequences=max_attempt, return_prob=False)
             else:
@@ -315,7 +297,7 @@ class ReactAgent:
 
         else:
             # code generation batching
-            if "gpt" not in self.code_model_name:
+            if self.code_backend == "local":
                 batch_data = [{"instruction": instruction,
                                "table_df": self.table_df} for i in range(max_attempt)]
                 states = table_operation.run_batch(
@@ -466,7 +448,7 @@ class ReactAgent:
             prompt = NUMERICAL_OPERATION_PROMPT.format(
                 instruction=instruction, table_df=table_df, examples=NUMERICAL_OPERATION_EXAMPLE)
             messages = [{"role": "user", "content": prompt}]
-            if "gpt" not in self.code_model_name:
+            if self.code_backend == "local":
                 codes = self.llm(
                     messages, num_return_sequences=max_attempt, return_prob=False)
             else:
@@ -483,7 +465,7 @@ class ReactAgent:
                 results.append(result)
 
         else:
-            if "gpt" not in self.code_model_name:
+            if self.code_backend == "local":
                 # code generation batching
                 batch_data = [{"instruction": instruction, "table_df": table_df}
                               for i in range(max_attempt)]
@@ -780,13 +762,19 @@ class ReactAgent:
 
     def step(self) -> None:
         if self.direct_reasoning:
-            llm_sampled = self.prompt_agent(mode="text")
+            if self.plan_backend == "openai":
+                llm_sampled = self.prompt_agent_gpt(mode="text")
+            else:
+                llm_sampled = self.prompt_agent(mode="text")
             llm_sampled_ = [self.get_answer_from_llm(
                 item) for item in llm_sampled]
             prompt = self.code_prompt.format(
                 examples=self.code_examples, table=self.table_df, question=self.question, context=self.context)
-            code_sampled = [direct_code.run(prompt, backend=self.codeagent_endpoint)[
-                "result"] for i in range(self.code_sample)]
+            if self.code_backend == "openai":
+                code_sampled = self.prompt_agent_gpt_coder(prompt)
+            else:
+                code_sampled = [direct_code.run(prompt, backend=self.codeagent_endpoint)[
+                    "result"] for i in range(self.code_sample)]
             code_sampled_ = [self.get_answer_from_code(
                 item) for item in code_sampled]
             self.llm_sampled = [item for item in llm_sampled_ if item != ""]
@@ -797,7 +785,7 @@ class ReactAgent:
             self.finished = True
 
         else:
-            if "gpt" in self.plan_model_name:
+            if self.plan_backend == "openai":
                 sampled = self.prompt_agent_gpt()
             else:
                 sampled = self.prompt_agent(mode="both")
@@ -876,13 +864,15 @@ class ReactAgent:
                 print("==============current step===========")
                 print(self.scratchpad)
 
-    def prompt_agent_gpt(self) -> str:
-        prompt = self._build_agent_prompt()
-        preds = get_completion(prompt, client=self.client, n=self.plan_sample)
+    def prompt_agent_gpt(self, mode="both") -> str:
+        prompt = self._build_agent_prompt(mode=mode)
+        preds = get_completion(
+            prompt, client=self.client, n=self.plan_sample, model=self.plan_model_name)
         return preds
 
     def prompt_agent_gpt_coder(self, prompt) -> str:
-        preds = get_completion(prompt, client=self.client, n=self.code_sample)
+        preds = get_completion(
+            prompt, client=self.client, n=self.code_sample, model=self.code_model_name)
         return preds
 
     def global_planning(self, given_plan) -> None:
@@ -917,12 +907,12 @@ class ReactAgent:
             table=self.table_string,
             context=self.context,
             question=self.question)
-        if "gpt" not in self.plan_model_name:
+        if self.plan_backend == "local":
             answer = self.llm(
                 prompt, num_return_sequences=self.plan_sample, return_prob=False)
         else:
             answer = get_completion(
-                prompt, client=self.client, n=self.plan_sample)
+                prompt, client=self.client, n=self.plan_sample, model=self.plan_model_name)
         answers = [ans.split(":")[-1].strip() for ans in answer]
         answer = Counter(answers).most_common(1)[0][0]
         return answer
@@ -941,6 +931,9 @@ class ReactAgent:
             table=self.table_string,
             context=self.context,
             question=self.question)
+        if self.plan_backend == "openai":
+            return get_completion(
+                prompt, client=self.client, n=1, model=self.plan_model_name)
         return self.llm(prompt, num_return_sequences=1, return_prob=False)
 
     def _build_agent_prompt(self, mode="both") -> str:
