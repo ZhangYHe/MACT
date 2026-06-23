@@ -25,11 +25,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
 
+import json
 import re
 import string
 from collections import Counter, OrderedDict, defaultdict
 
 import pandas as pd
+import wikipedia
 from fewshots_table import (DEMO_CRT, DEMO_CRT_DIRECT, DEMO_SCITAB,
                             DEMO_SCITAB_DIRECT, DEMO_TAT, DEMO_TAT_DIRECT,
                             DEMO_WTQ, DEMO_WTQ_DIRECT,
@@ -37,21 +39,38 @@ from fewshots_table import (DEMO_CRT, DEMO_CRT_DIRECT, DEMO_SCITAB,
                             TABLE_OPERATION_EXAMPLE, DEMO_DATABENCH,
                             NUMERICAL_OPERATION_EXAMPLE_LONG_TABLE, GLOBAL_PLAN_EXAMPLES,
                             NUMERICAL_OPERATION_EXAMPLE_LONG_TABLE_GLOBAL)
-from langchain import Wikipedia
-from langchain.agents.react.base import DocstoreExplorer
 from llm import OpenSourceLLM
 from prompts_table import (DIRECT_AGENT, NUMERICAL_OPERATION_PROMPT,
                            TABLE_OPERATION_PROMPT, react_agent_prompt_crt,
                            react_agent_prompt_scitab, react_agent_prompt_tat,
                            react_agent_prompt_wtq, NUMERICAL_OPERATION_PROMPT_LONG_TABLE,
                            NUMERICAL_OPERATION_PROMPT_LONG_TABLE_GLOBAL,
-                           react_agent_prompt_databench, global_plan_prompt)
+                           react_agent_prompt_databench, global_plan_prompt,
+                           QUESTION_ROUTER_PROMPT, ROUTED_CONTEXT_TEMPLATE,
+                           VERIFY_ACTION_INSTRUCTION, VERIFY_PROMPT)
 from sglang import assistant, function, gen, user
 from tot import llm_reward, vote_prompt_as
 from utils import (extract_from_outputs, parse_action, table2df,
                    table_linear)
 
 all_input_token, all_output_token = 0, 0
+
+
+class SimpleWikipediaSearch:
+    def search(self, entity):
+        try:
+            return wikipedia.summary(entity, sentences=3, auto_suggest=False)
+        except wikipedia.DisambiguationError as e:
+            if e.options:
+                return wikipedia.summary(
+                    e.options[0], sentences=3, auto_suggest=False)
+            raise
+        except wikipedia.PageError:
+            results = wikipedia.search(entity, results=1)
+            if results:
+                return wikipedia.summary(
+                    results[0], sentences=3, auto_suggest=False)
+            raise
 
 
 def get_completion(prompt, client, n, model):
@@ -155,12 +174,21 @@ class ReactAgent:
                  debugging=False,
                  client=None,
                  plan_backend='auto',
-                 code_backend='auto'
+                 code_backend='auto',
+                 use_router=False,
+                 use_verify_action=False,
+                 use_repair=False,
+                 log_router=True
                  ) -> None:
 
         vllm = model
         self.plan_backend = plan_backend
         self.code_backend = code_backend
+        self.use_router = use_router
+        self.use_verify_action = use_verify_action
+        self.use_repair = use_repair
+        self.log_router = log_router
+        self.question_profile = None
         if self.plan_backend == "local":
             self.llm = OpenSourceLLM(
                 model_name=plan_model_name,
@@ -199,7 +227,7 @@ class ReactAgent:
         self.evaluator_output = []
         self.use_pre_answer = use_pre_answer
         self.pre_ans_all = []
-        self.docstore = DocstoreExplorer(Wikipedia())  # Search
+        self.docstore = SimpleWikipediaSearch()  # Search
         self.answer_aggrement = answer_aggrement
         self.direct_reasoning = direct_reasoning
         self.without_tool = without_tool
@@ -392,6 +420,7 @@ class ReactAgent:
             return result, rows, None, None
         else:
             current_error = None
+            executable_code = None
             try:
                 executable_code = re.findall(p, code_strings)[0]
                 executable_code = "\n".join(executable_code.split("\n")[1:-1])
@@ -410,7 +439,6 @@ class ReactAgent:
             except Exception as e:
                 # print(e)
                 current_error = e
-                executable_code = None
             if isinstance(result, pd.Series):
                 result = result.to_frame()
             if isinstance(result, pd.DataFrame) and not result.empty:
@@ -491,6 +519,12 @@ class ReactAgent:
             for code_string in code_strings:
                 result, rows, error, extracted_code = self.code_extract_calculator(
                     code_string, table_df, original_df)
+                if self.use_repair and error is not None and extracted_code:
+                    revised_code = self.revise_code(
+                        error, extracted_code, table_df)
+                    if revised_code:
+                        result, rows, _, _ = self.code_extract_calculator(
+                            revised_code, table_df, original_df)
                 if result != "" and rows != []:
                     try:
                         result = result.strip()
@@ -738,9 +772,160 @@ class ReactAgent:
             result = str(result)
         return result
 
+    def _call_plan_llm_once(self, prompt):
+        if self.plan_backend == "openai":
+            return get_completion(
+                prompt, client=self.client, n=1, model=self.plan_model_name)[0]
+        return self.llm(prompt, num_return_sequences=1, return_prob=False)[0]
+
+    def _extract_json_object(self, output):
+        try:
+            output = output.strip()
+            if output.startswith("```"):
+                output = re.sub(r"^```(?:json)?", "", output)
+                output = re.sub(r"```$", "", output).strip()
+            matched = re.search(r"\{.*\}", output, re.DOTALL)
+            if matched:
+                output = matched.group(0)
+            return json.loads(output)
+        except Exception:
+            return None
+
+    def _default_question_profile(self):
+        allowed_tools = ["Retrieve", "Calculate", "Search", "Finish"]
+        if self.task == "tat":
+            allowed_tools = ["Retrieve", "Calculate", "Finish"]
+        elif self.task == "databench":
+            allowed_tools = ["Operate", "Finish"]
+        if self.use_verify_action:
+            allowed_tools.append("Verify")
+        return {
+            "question_type": "multi_hop",
+            "target_columns": [],
+            "constraints": [],
+            "required_operations": [],
+            "allowed_tools": allowed_tools,
+            "reasoning_pattern": "Use the original MACT ReAct process and choose tools according to the question."
+        }
+
+    def _normalize_question_profile(self, profile):
+        default_profile = self._default_question_profile()
+        if not isinstance(profile, dict):
+            return default_profile
+        for key, value in default_profile.items():
+            profile.setdefault(key, value)
+        if not isinstance(profile["allowed_tools"], list):
+            profile["allowed_tools"] = default_profile["allowed_tools"]
+        if self.use_verify_action and "Verify" not in profile["allowed_tools"]:
+            profile["allowed_tools"].append("Verify")
+        if not self.use_verify_action:
+            profile["allowed_tools"] = [
+                tool for tool in profile["allowed_tools"] if tool != "Verify"]
+        return profile
+
+    def get_table_headers(self):
+        try:
+            loc = {}
+            exec(self.table_df, globals(), loc)
+            return list(loc["df"].columns)
+        except Exception:
+            try:
+                header_line = self.table_string.split("\n")[0]
+                return [item.strip() for item in header_line.split("|") if item.strip()]
+            except Exception:
+                return []
+
+    def route_question(self):
+        prompt = QUESTION_ROUTER_PROMPT.format(
+            question=self.question,
+            context=self.context,
+            headers=self.get_table_headers()
+        )
+        try:
+            output = self._call_plan_llm_once(prompt)
+            profile = self._extract_json_object(output)
+            self.question_profile = self._normalize_question_profile(profile)
+        except Exception:
+            self.question_profile = self._default_question_profile()
+        if self.log_router:
+            print("==============question router===========")
+            print(json.dumps(self.question_profile, ensure_ascii=False))
+        return self.question_profile
+
+    def _build_control_context(self):
+        control_context = ""
+        if self.use_router:
+            if self.question_profile is None:
+                self.question_profile = self._default_question_profile()
+            control_context += ROUTED_CONTEXT_TEMPLATE.format(
+                question_type=self.question_profile["question_type"],
+                target_columns=self.question_profile["target_columns"],
+                constraints=self.question_profile["constraints"],
+                required_operations=self.question_profile["required_operations"],
+                allowed_tools=self.question_profile["allowed_tools"],
+                reasoning_pattern=self.question_profile["reasoning_pattern"]
+            )
+        if self.use_verify_action:
+            control_context += VERIFY_ACTION_INSTRUCTION
+        if control_context:
+            control_context += "\n"
+        return control_context
+
+    def verifier_tool(self, claim):
+        prompt = VERIFY_PROMPT.format(
+            question=self.question,
+            context=self.context,
+            table=self.table_string,
+            scratchpad=self.scratchpad,
+            claim=claim
+        )
+        try:
+            output = self._call_plan_llm_once(prompt)
+            parsed = self._extract_json_object(output)
+            if isinstance(parsed, dict):
+                valid = parsed.get("valid", False)
+                status = "passed" if valid else "failed"
+                reason = parsed.get("reason", "")
+                suggested_next_action = parsed.get("suggested_next_action", "")
+                error_type = parsed.get("error_type", "none")
+                observation = f"Verification {status}. error_type: {error_type}. reason: {reason}"
+                if suggested_next_action:
+                    observation += f" suggested_next_action: {suggested_next_action}"
+                return observation
+            return output.strip()
+        except Exception as e:
+            return f"Verification failed. error_type: verifier_error. reason: {e}"
+
+    def repair_feedback(self, action_type, argument):
+        return (
+            f"Repair feedback: the {action_type} action returned an empty result. "
+            f"Revise the next action or code instruction. Previous argument: {argument}"
+        )
+
+    def revise_code(self, current_error, extracted_code, table_df):
+        try:
+            if self.code_backend == "openai":
+                prompt = (
+                    "You are an expert in revising code. The following code results in an error when executing on "
+                    "the table dataframe. Please revise the code to address the error and only return the revised "
+                    f"code in one python code block.\nTable dataframe: {table_df}\nErroneous code: {extracted_code}\n"
+                    f"Error message: {current_error}\nRevised code:"
+                )
+                return self.prompt_agent_gpt_coder(prompt)[0]
+            return code_revise.run(
+                current_error=str(current_error),
+                extracted_code=extracted_code,
+                table_df=table_df,
+                backend=self.codeagent_endpoint
+            )["result"]
+        except Exception:
+            return ""
+
     def run(self, reset=True, given_plan=None) -> None:
         if reset:
             self.__reset_agent()
+        if self.use_router and not self.direct_reasoning:
+            self.route_question()
         if self.task == "databench":
             if not self.is_finished():
                 self.global_planning(given_plan)
@@ -797,8 +982,8 @@ class ReactAgent:
                 self.answer = self.pre_ans
             else:
                 if thought != "" and action != "":
-                    if "Finish" not in action:
-                        action_type, argument = parse_action(action)
+                    action_type, argument = parse_action(action)
+                    if action_type != "Finish":
                         if action_type == "Calculate":
                             recent_table_df = self.table_dfs[-1]
                             new_ob = self.calculator_tool(
@@ -806,14 +991,18 @@ class ReactAgent:
                             if not isinstance(new_ob, list):
                                 if new_ob != "":
                                     observation = f"Observation {self.step_n}: {new_ob}"
+                                elif self.use_repair:
+                                    observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
                             else:
                                 # majority voting among tool results and llm results
                                 if new_ob != []:
                                     new_ob = [
                                         f'Observation {self.step_n}: {item}' for item in new_ob]
-                                new_ob += all_observations
-                                observation = Counter(
-                                    new_ob).most_common(1)[0][0]
+                                    new_ob += all_observations
+                                    observation = Counter(
+                                        new_ob).most_common(1)[0][0]
+                                elif self.use_repair:
+                                    observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
 
                         elif action_type == "Retrieve":
                             new_ob = self.retriever_tool(
@@ -825,6 +1014,8 @@ class ReactAgent:
                                     new_ob += all_observations
                                 observation = Counter(
                                     new_ob).most_common(1)[0][0]
+                            elif self.use_repair:
+                                observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
 
                         elif action_type == "Search":
                             if self.without_tool:
@@ -836,13 +1027,20 @@ class ReactAgent:
                                     observation = f"Observation {self.step_n}: {observation_wiki}"
                                 except Exception as e:
                                     # cannot find on wikipedia, use llm search results
-                                    pass
+                                    if self.use_repair:
+                                        observation = f"Observation {self.step_n}: Repair feedback: Search failed with error: {e}"
                         elif action_type == "Operate":
                             recent_table_df = self.table_dfs[-1]
                             new_ob = self.calculator_tool(
                                 argument, recent_table_df=recent_table_df)
                             if new_ob != "":
                                 observation = f"Observation {self.step_n}: {new_ob}"
+                            elif self.use_repair:
+                                observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
+
+                        elif action_type == "Verify" and self.use_verify_action:
+                            verification = self.verifier_tool(argument)
+                            observation = f"Observation {self.step_n}: {verification}"
 
                         if observation != "":
                             self.scratchpad += thought + "\n"
@@ -852,7 +1050,6 @@ class ReactAgent:
 
                     else:
                         # finish in the action
-                        action_type, argument = parse_action(action)
                         self.answer = argument
                         self.scratchpad += thought + "\n"
                         self.scratchpad += action + "\n"
@@ -944,12 +1141,13 @@ class ReactAgent:
                 context=self.context,
                 question=self.question)
         elif mode == "both":
+            scratchpad = self._build_control_context() + self.scratchpad
             return self.agent_prompt.format(
                 examples=self.react_examples,
                 table=self.table_string,
                 context=self.context,
                 question=self.question,
-                scratchpad=self.scratchpad)
+                scratchpad=scratchpad)
 
     def is_finished(self) -> bool:
         return self.finished

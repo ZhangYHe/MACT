@@ -136,12 +136,17 @@ def dfcode2str(dfcode):
 
 
 def parse_action(string):
-    string = re.findall(r'Retrieve\[.+?\]', string)+re.findall(r'Operate\[.+?\]', string)+re.findall(
-        r'Finish\[.+?\]', string)+re.findall(r'Search\[.+?\]', string)+re.findall(r'Calculate\[.+?\]', string)
-    if string:
-        string = string[0]
+    first_action = re.search(
+        r'(Retrieve|Operate|Finish|Search|Calculate|Verify)\[.+?\]', string)
+    if first_action and first_action.group(0).startswith("Verify["):
+        actions = [first_action.group(0)]
+    else:
+        actions = re.findall(r'Retrieve\[.+?\]', string)+re.findall(r'Operate\[.+?\]', string)+re.findall(
+            r'Finish\[.+?\]', string)+re.findall(r'Search\[.+?\]', string)+re.findall(r'Calculate\[.+?\]', string)+re.findall(r'Verify\[.+?\]', string)
+    if actions:
+        action = actions[0]
         pattern = r'^(\w+)\[(.+)\]$'
-        match = re.match(pattern, string)
+        match = re.match(pattern, action)
         if match:
             action_type = match.group(1)
             argument = match.group(2)

@@ -150,7 +150,11 @@ def main(args):
         plan_backend=plan_backend,
         code_backend=code_backend,
         code_as_observation=args.code_as_observation,
-        without_tool=args.without_tool) for _, row in enumerate(table_dataset)]
+        without_tool=args.without_tool,
+        use_router=args.use_router,
+        use_verify_action=args.use_verify_action,
+        use_repair=args.use_repair,
+        log_router=args.log_router) for _, row in enumerate(table_dataset)]
     if args.debugging:
         agents = agents[0:1]
         for idx, agent in enumerate([a for a in agents]):
@@ -241,5 +245,13 @@ if __name__ == '__main__':
     parser.add_argument('--debugging', action='store_true')
     parser.add_argument('--code_as_observation', action='store_true',
                         help="only use code as the final observations or not.")
+    parser.add_argument('--use_router', action='store_true',
+                        help="enable question type routing before step-wise planning.")
+    parser.add_argument('--use_verify_action', action='store_true',
+                        help="allow the planner to use Verify[claim] as an explicit action.")
+    parser.add_argument('--use_repair', action='store_true',
+                        help="write repair feedback when a tool action returns an empty result or fails.")
+    parser.add_argument('--log_router', action='store_true', default=True,
+                        help="print the question router profile when --use_router is enabled.")
     args = parser.parse_args()
     main(args)

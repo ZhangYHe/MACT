@@ -25,7 +25,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """ 
 
-from langchain.prompts import PromptTemplate
+try:
+    from langchain.prompts import PromptTemplate
+except Exception:
+    class PromptTemplate:
+        def __init__(self, input_variables, template):
+            self.input_variables = input_variables
+            self.template = template
+
+        def format(self, **kwargs):
+            return self.template.format(**kwargs)
 
 DIRECT_AGENT = """You are given a question, some optinal context, and a table in string format. Solve the question with reasoning and output the final answer following: Therefore, the answer is: [answer].
 Here are some examples:
@@ -49,6 +58,70 @@ Context: {context}
 Question: {question}
 Code: 
 
+"""
+
+
+QUESTION_ROUTER_PROMPT = """You are an expert in table question answering. Classify the question using only the question, context, and table headers.
+
+Choose exactly one question_type from:
+lookup, filter, comparison, aggregation, arithmetic, multi_hop.
+
+Return only a JSON object with these keys:
+{{
+  "question_type": "...",
+  "target_columns": ["..."],
+  "constraints": ["..."],
+  "required_operations": ["..."],
+  "allowed_tools": ["Retrieve", "Calculate", "Search", "Finish"],
+  "reasoning_pattern": "..."
+}}
+
+Use "Search" only when external entity knowledge may be needed. Include "Verify" in allowed_tools only when verification may be useful for ambiguous, multi-step, or calculation-heavy questions.
+
+Question: {question}
+Context: {context}
+Table headers: {headers}
+"""
+
+
+VERIFY_PROMPT = """You are verifying a table question answering reasoning step.
+
+Judge whether the claim is supported by the table question, context, and reasoning history. Check whether the claim is non-empty, satisfies the question constraints, uses the required operation, and is supported by the available evidence.
+
+Return only a JSON object with these keys:
+{{
+  "valid": true,
+  "error_type": "none",
+  "reason": "...",
+  "suggested_next_action": "..."
+}}
+
+If the claim is not supported, set valid to false and choose one error_type from:
+empty_result, missing_constraint, wrong_operation, unsupported_answer, unclear.
+
+Question: {question}
+Context: {context}
+Table:
+{table}
+Reasoning history:
+{scratchpad}
+Claim to verify: {claim}
+"""
+
+
+ROUTED_CONTEXT_TEMPLATE = """Question routing profile:
+- question_type: {question_type}
+- target_columns: {target_columns}
+- constraints: {constraints}
+- required_operations: {required_operations}
+- allowed_tools: {allowed_tools}
+- reasoning_pattern: {reasoning_pattern}
+Use this profile to choose actions, but keep following the original task format.
+"""
+
+
+VERIFY_ACTION_INSTRUCTION = """Additional optional action:
+(Verify) Verify[claim], which checks whether a retrieved result, calculated result, or candidate final answer is supported. Use Verify only when you are uncertain about evidence, constraints, or a multi-step/calculation-heavy result. Do not verify every step.
 """
 
 
