@@ -10,10 +10,10 @@ python tqa.py \
   --code_model_name gpt-5.4 \
   --dataset_path ../datasets_examples/tat.jsonl \
   --task wtq \
-  --limit 1 \
+  --limit 2 \
   --plan_sample 1 \
   --code_sample 1 \
   --use_router \
-  --use_verify_action \
-  --use_repair \
+  --use_verifier \
+  --use_code_repair \
   --output_path ../output/router_verify_limit_test.jsonl

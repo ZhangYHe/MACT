@@ -176,8 +176,9 @@ class ReactAgent:
                  plan_backend='auto',
                  code_backend='auto',
                  use_router=False,
-                 use_verify_action=False,
+                 use_verifier=False,
                  use_repair=False,
+                 use_code_repair=False,
                  log_router=True
                  ) -> None:
 
@@ -185,10 +186,12 @@ class ReactAgent:
         self.plan_backend = plan_backend
         self.code_backend = code_backend
         self.use_router = use_router
-        self.use_verify_action = use_verify_action
-        self.use_repair = use_repair
+        self.use_verifier = use_verifier
+        self.use_code_repair = use_code_repair or use_repair
+        self.use_repair = self.use_code_repair
         self.log_router = log_router
         self.question_profile = None
+        self.verification_cache = {}
         if self.plan_backend == "local":
             self.llm = OpenSourceLLM(
                 model_name=plan_model_name,
@@ -387,6 +390,8 @@ class ReactAgent:
     def code_extract_calculator(self, code_strings, table_df, original_df):
         result = ""
         rows = []
+        current_error = None
+        executable_code = None
         p = re.compile(r"```[Python|python].*```", re.DOTALL)
         if not self.task == "databench":
             try:
@@ -397,9 +402,9 @@ class ReactAgent:
                 loc = {}
                 exec(executable_code, globals(), loc)
                 result = loc['final_result']
-            except:
+            except Exception as e:
                 # print(e)
-                pass
+                current_error = e
             if isinstance(result, pd.Series):
                 result = result.to_frame()
 
@@ -417,10 +422,8 @@ class ReactAgent:
                     result = table_linear(rows, num_row=None)
                 except:
                     result = str(result)
-            return result, rows, None, None
+            return result, rows, current_error, executable_code
         else:
-            current_error = None
-            executable_code = None
             try:
                 executable_code = re.findall(p, code_strings)[0]
                 executable_code = "\n".join(executable_code.split("\n")[1:-1])
@@ -469,6 +472,7 @@ class ReactAgent:
         max_attempt = self.code_sample
         results, generated_code = [], []
         results2df = defaultdict(list)
+        original_df = None
         if df_path:
             original_df = pd.read_parquet(df_path, engine='pyarrow')
 
@@ -482,8 +486,14 @@ class ReactAgent:
             else:
                 codes = self.prompt_agent_gpt_coder(prompt)
             for code_strings in codes:
-                result, rows = self.code_extract_calculator(
+                result, rows, error, extracted_code = self.code_extract_calculator(
                     code_strings, table_df, original_df)
+                if self.use_code_repair and error is not None and extracted_code:
+                    revised_code = self.revise_code(
+                        error, extracted_code, table_df)
+                    if revised_code:
+                        result, rows, _, _ = self.code_extract_calculator(
+                            revised_code, table_df, original_df)
                 if result != "" and rows != []:
                     try:
                         result = result.strip()
@@ -491,6 +501,7 @@ class ReactAgent:
                     except:
                         pass
                 results.append(result)
+                generated_code.append(extracted_code)
 
         else:
             if self.code_backend == "local":
@@ -519,7 +530,7 @@ class ReactAgent:
             for code_string in code_strings:
                 result, rows, error, extracted_code = self.code_extract_calculator(
                     code_string, table_df, original_df)
-                if self.use_repair and error is not None and extracted_code:
+                if self.use_code_repair and error is not None and extracted_code:
                     revised_code = self.revise_code(
                         error, extracted_code, table_df)
                     if revised_code:
@@ -797,7 +808,7 @@ class ReactAgent:
             allowed_tools = ["Retrieve", "Calculate", "Finish"]
         elif self.task == "databench":
             allowed_tools = ["Operate", "Finish"]
-        if self.use_verify_action:
+        if self.use_verifier:
             allowed_tools.append("Verify")
         return {
             "question_type": "multi_hop",
@@ -816,9 +827,9 @@ class ReactAgent:
             profile.setdefault(key, value)
         if not isinstance(profile["allowed_tools"], list):
             profile["allowed_tools"] = default_profile["allowed_tools"]
-        if self.use_verify_action and "Verify" not in profile["allowed_tools"]:
+        if self.use_verifier and "Verify" not in profile["allowed_tools"]:
             profile["allowed_tools"].append("Verify")
-        if not self.use_verify_action:
+        if not self.use_verifier:
             profile["allowed_tools"] = [
                 tool for tool in profile["allowed_tools"] if tool != "Verify"]
         return profile
@@ -865,13 +876,60 @@ class ReactAgent:
                 allowed_tools=self.question_profile["allowed_tools"],
                 reasoning_pattern=self.question_profile["reasoning_pattern"]
             )
-        if self.use_verify_action:
+        if self.use_verifier:
             control_context += VERIFY_ACTION_INSTRUCTION
         if control_context:
             control_context += "\n"
         return control_context
 
-    def verifier_tool(self, claim):
+    def _verification_cache_key(self, claim):
+        return normalize_answer(str(claim))
+
+    def _format_verification_observation(self, parsed, prefix="Verification"):
+        valid = self._is_verification_valid(parsed)
+        status = "passed" if valid else "failed"
+        reason = parsed.get("reason", "")
+        suggested_next_action = parsed.get("suggested_next_action", "")
+        error_type = parsed.get("error_type", "none")
+        observation = f"{prefix} {status}. error_type: {error_type}. reason: {reason}"
+        if suggested_next_action:
+            observation += f" suggested_next_action: {suggested_next_action}"
+        return observation
+
+    def _is_verification_valid(self, parsed):
+        valid = parsed.get("valid", False)
+        if isinstance(valid, str):
+            return valid.strip().lower() in ["true", "yes", "valid", "pass", "passed"]
+        return bool(valid)
+
+    def _rule_verify_answer(self, answer):
+        normalized_answer = normalize_answer(str(answer))
+        if not normalized_answer:
+            return {
+                "valid": False,
+                "error_type": "empty_result",
+                "reason": "The answer is empty.",
+                "suggested_next_action": "Continue reasoning and produce a non-empty answer."
+            }
+        evidence = "\n".join([
+            self.scratchpad,
+            self.context,
+            self.table_string
+        ])
+        normalized_evidence = normalize_answer(evidence)
+        if normalized_answer and normalized_answer in normalized_evidence:
+            return {
+                "valid": True,
+                "error_type": "none",
+                "reason": "The answer appears in the available table, context, or reasoning history.",
+                "suggested_next_action": ""
+            }
+        return None
+
+    def _llm_verify_claim(self, claim):
+        cache_key = self._verification_cache_key(claim)
+        if cache_key in self.verification_cache:
+            return self.verification_cache[cache_key]
         prompt = VERIFY_PROMPT.format(
             question=self.question,
             context=self.context,
@@ -883,18 +941,46 @@ class ReactAgent:
             output = self._call_plan_llm_once(prompt)
             parsed = self._extract_json_object(output)
             if isinstance(parsed, dict):
-                valid = parsed.get("valid", False)
-                status = "passed" if valid else "failed"
-                reason = parsed.get("reason", "")
-                suggested_next_action = parsed.get("suggested_next_action", "")
-                error_type = parsed.get("error_type", "none")
-                observation = f"Verification {status}. error_type: {error_type}. reason: {reason}"
-                if suggested_next_action:
-                    observation += f" suggested_next_action: {suggested_next_action}"
-                return observation
-            return output.strip()
+                parsed.setdefault("valid", False)
+                parsed.setdefault("error_type", "unclear")
+                parsed.setdefault("reason", "")
+                parsed.setdefault("suggested_next_action", "")
+                parsed["valid"] = self._is_verification_valid(parsed)
+            else:
+                parsed = {
+                    "valid": False,
+                    "error_type": "unclear",
+                    "reason": output.strip(),
+                    "suggested_next_action": "Continue reasoning with stronger evidence."
+                }
         except Exception as e:
-            return f"Verification failed. error_type: verifier_error. reason: {e}"
+            parsed = {
+                "valid": False,
+                "error_type": "verifier_error",
+                "reason": str(e),
+                "suggested_next_action": "Continue reasoning without relying on the failed verifier call."
+            }
+        self.verification_cache[cache_key] = parsed
+        return parsed
+
+    def verify_finish_answer(self, answer):
+        cache_key = self._verification_cache_key(answer)
+        if cache_key in self.verification_cache:
+            return self.verification_cache[cache_key]
+        rule_result = self._rule_verify_answer(answer)
+        if rule_result is not None:
+            self.verification_cache[cache_key] = rule_result
+            return rule_result
+        return self._llm_verify_claim(answer)
+
+    def verifier_tool(self, claim):
+        rule_result = self._rule_verify_answer(claim)
+        if rule_result is not None:
+            self.verification_cache[self._verification_cache_key(claim)] = rule_result
+            parsed = rule_result
+        else:
+            parsed = self._llm_verify_claim(claim)
+        return self._format_verification_observation(parsed)
 
     def repair_feedback(self, action_type, argument):
         return (
@@ -977,7 +1063,7 @@ class ReactAgent:
             self.actual_step_n += 1
             thought, action, observation, all_observations = self.as_reward_fn(
                 sampled)
-            if self.use_pre_answer and self.pre_ans:
+            if self.use_pre_answer and self.pre_ans and not self.use_verifier:
                 self.finished = True
                 self.answer = self.pre_ans
             else:
@@ -991,8 +1077,6 @@ class ReactAgent:
                             if not isinstance(new_ob, list):
                                 if new_ob != "":
                                     observation = f"Observation {self.step_n}: {new_ob}"
-                                elif self.use_repair:
-                                    observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
                             else:
                                 # majority voting among tool results and llm results
                                 if new_ob != []:
@@ -1001,8 +1085,6 @@ class ReactAgent:
                                     new_ob += all_observations
                                     observation = Counter(
                                         new_ob).most_common(1)[0][0]
-                                elif self.use_repair:
-                                    observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
 
                         elif action_type == "Retrieve":
                             new_ob = self.retriever_tool(
@@ -1014,8 +1096,6 @@ class ReactAgent:
                                     new_ob += all_observations
                                 observation = Counter(
                                     new_ob).most_common(1)[0][0]
-                            elif self.use_repair:
-                                observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
 
                         elif action_type == "Search":
                             if self.without_tool:
@@ -1027,18 +1107,15 @@ class ReactAgent:
                                     observation = f"Observation {self.step_n}: {observation_wiki}"
                                 except Exception as e:
                                     # cannot find on wikipedia, use llm search results
-                                    if self.use_repair:
-                                        observation = f"Observation {self.step_n}: Repair feedback: Search failed with error: {e}"
+                                    pass
                         elif action_type == "Operate":
                             recent_table_df = self.table_dfs[-1]
                             new_ob = self.calculator_tool(
                                 argument, recent_table_df=recent_table_df)
                             if new_ob != "":
                                 observation = f"Observation {self.step_n}: {new_ob}"
-                            elif self.use_repair:
-                                observation = f"Observation {self.step_n}: {self.repair_feedback(action_type, argument)}"
 
-                        elif action_type == "Verify" and self.use_verify_action:
+                        elif action_type == "Verify" and self.use_verifier:
                             verification = self.verifier_tool(argument)
                             observation = f"Observation {self.step_n}: {verification}"
 
@@ -1050,10 +1127,22 @@ class ReactAgent:
 
                     else:
                         # finish in the action
-                        self.answer = argument
                         self.scratchpad += thought + "\n"
                         self.scratchpad += action + "\n"
-                        self.finished = True
+                        if self.use_verifier:
+                            verification = self.verify_finish_answer(argument)
+                            observation = self._format_verification_observation(
+                                verification, prefix="Final verification")
+                            self.scratchpad += f"Observation {self.step_n}: {observation}\n"
+                            self.step_n += 1
+                            if self._is_verification_valid(verification):
+                                self.answer = argument
+                                self.finished = True
+                            else:
+                                pass
+                        else:
+                            self.answer = argument
+                            self.finished = True
 
                 else:
                     # resample
@@ -1165,6 +1254,7 @@ class ReactAgent:
         self.actual_step_n = 1
         self.finished = False
         self.scratchpad: str = ''
+        self.verification_cache = {}
 
     def set_qa(self, question: str, key: str) -> None:
         self.question = question

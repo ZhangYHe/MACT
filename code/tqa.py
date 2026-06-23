@@ -152,8 +152,9 @@ def main(args):
         code_as_observation=args.code_as_observation,
         without_tool=args.without_tool,
         use_router=args.use_router,
-        use_verify_action=args.use_verify_action,
+        use_verifier=args.use_verifier,
         use_repair=args.use_repair,
+        use_code_repair=args.use_code_repair,
         log_router=args.log_router) for _, row in enumerate(table_dataset)]
     if args.debugging:
         agents = agents[0:1]
@@ -247,10 +248,12 @@ if __name__ == '__main__':
                         help="only use code as the final observations or not.")
     parser.add_argument('--use_router', action='store_true',
                         help="enable question type routing before step-wise planning.")
-    parser.add_argument('--use_verify_action', action='store_true',
-                        help="allow the planner to use Verify[claim] as an explicit action.")
+    parser.add_argument('--use_verifier', action='store_true',
+                        help="enable explicit Verify[claim] and final-answer verification.")
+    parser.add_argument('--use_code_repair', action='store_true',
+                        help="revise generated calculation code once when execution fails.")
     parser.add_argument('--use_repair', action='store_true',
-                        help="write repair feedback when a tool action returns an empty result or fails.")
+                        help="deprecated alias for --use_code_repair.")
     parser.add_argument('--log_router', action='store_true', default=True,
                         help="print the question router profile when --use_router is enabled.")
     args = parser.parse_args()

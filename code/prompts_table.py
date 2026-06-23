@@ -84,9 +84,9 @@ Table headers: {headers}
 """
 
 
-VERIFY_PROMPT = """You are verifying a table question answering reasoning step.
+VERIFY_PROMPT = """You are verifying a table question answering reasoning step or final answer.
 
-Judge whether the claim is supported by the table question, context, and reasoning history. Check whether the claim is non-empty, satisfies the question constraints, uses the required operation, and is supported by the available evidence.
+Judge whether the claim directly answers the question and is supported by the table, context, or reasoning history. Check whether the claim is non-empty, satisfies the question constraints, uses the required operation when relevant, and is supported by the available evidence.
 
 Return only a JSON object with these keys:
 {{
