@@ -155,6 +155,9 @@ def main(args):
         use_verifier=args.use_verifier,
         use_repair=args.use_repair,
         use_code_repair=args.use_code_repair,
+        disable_search=args.disable_search,
+        disable_calculate=args.disable_calculate,
+        disable_coding_agent=args.disable_coding_agent,
         log_router=args.log_router) for _, row in enumerate(table_dataset)]
     if args.debugging:
         agents = agents[0:1]
@@ -254,6 +257,12 @@ if __name__ == '__main__':
                         help="revise generated calculation code once when execution fails.")
     parser.add_argument('--use_repair', action='store_true',
                         help="deprecated alias for --use_code_repair.")
+    parser.add_argument('--disable_search', action='store_true',
+                        help="disable Search actions for ablation.")
+    parser.add_argument('--disable_calculate', action='store_true',
+                        help="disable Calculate and Operate actions for ablation.")
+    parser.add_argument('--disable_coding_agent', action='store_true',
+                        help="disable LLM code generation tools for ablation.")
     parser.add_argument('--log_router', action='store_true', default=True,
                         help="print the question router profile when --use_router is enabled.")
     args = parser.parse_args()

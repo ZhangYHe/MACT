@@ -179,6 +179,9 @@ class ReactAgent:
                  use_verifier=False,
                  use_repair=False,
                  use_code_repair=False,
+                 disable_search=False,
+                 disable_calculate=False,
+                 disable_coding_agent=False,
                  log_router=True
                  ) -> None:
 
@@ -189,6 +192,9 @@ class ReactAgent:
         self.use_verifier = use_verifier
         self.use_code_repair = use_code_repair or use_repair
         self.use_repair = self.use_code_repair
+        self.disable_search = disable_search
+        self.disable_calculate = disable_calculate
+        self.disable_coding_agent = disable_coding_agent
         self.log_router = log_router
         self.question_profile = None
         self.verification_cache = {}
@@ -303,6 +309,8 @@ class ReactAgent:
         return rows
 
     def retriever_tool(self, instruction):
+        if self.disable_coding_agent:
+            return []
         max_attempt = self.code_sample
         results = []
         results2dfs = defaultdict(list)
@@ -380,11 +388,12 @@ class ReactAgent:
         except:
             result = ""
             # try with the coder
-            try:
-                result = self.numerical_tool(
-                    eqution, recent_table_df, self.df_path, global_planning=False)
-            except:
-                pass
+            if not self.disable_coding_agent:
+                try:
+                    result = self.numerical_tool(
+                        eqution, recent_table_df, self.df_path, global_planning=False)
+                except:
+                    pass
             return result
 
     def code_extract_calculator(self, code_strings, table_df, original_df):
@@ -469,6 +478,8 @@ class ReactAgent:
             return result, rows, current_error, executable_code
 
     def numerical_tool(self, instruction, table_df, df_path=None, global_planning=False):
+        if self.disable_coding_agent:
+            return []
         max_attempt = self.code_sample
         results, generated_code = [], []
         results2df = defaultdict(list)
@@ -808,6 +819,7 @@ class ReactAgent:
             allowed_tools = ["Retrieve", "Calculate", "Finish"]
         elif self.task == "databench":
             allowed_tools = ["Operate", "Finish"]
+        allowed_tools = self._filter_disabled_tools(allowed_tools)
         if self.use_verifier:
             allowed_tools.append("Verify")
         return {
@@ -832,7 +844,21 @@ class ReactAgent:
         if not self.use_verifier:
             profile["allowed_tools"] = [
                 tool for tool in profile["allowed_tools"] if tool != "Verify"]
+        profile["allowed_tools"] = self._filter_disabled_tools(
+            profile["allowed_tools"])
         return profile
+
+    def _filter_disabled_tools(self, tools):
+        filtered = []
+        for tool in tools:
+            if self.disable_search and tool == "Search":
+                continue
+            if self.disable_calculate and tool in ["Calculate", "Operate"]:
+                continue
+            if self.disable_coding_agent and tool == "Retrieve":
+                continue
+            filtered.append(tool)
+        return filtered
 
     def get_table_headers(self):
         try:
@@ -1071,34 +1097,46 @@ class ReactAgent:
                     action_type, argument = parse_action(action)
                     if action_type != "Finish":
                         if action_type == "Calculate":
-                            recent_table_df = self.table_dfs[-1]
-                            new_ob = self.calculator_tool(
-                                argument, recent_table_df=recent_table_df)
-                            if not isinstance(new_ob, list):
-                                if new_ob != "":
-                                    observation = f"Observation {self.step_n}: {new_ob}"
+                            if self.disable_calculate:
+                                observation = f"Observation {self.step_n}: Calculate tool disabled by ablation."
                             else:
-                                # majority voting among tool results and llm results
+                                recent_table_df = self.table_dfs[-1]
+                                new_ob = self.calculator_tool(
+                                    argument, recent_table_df=recent_table_df)
+                                if not isinstance(new_ob, list):
+                                    if new_ob != "":
+                                        observation = f"Observation {self.step_n}: {new_ob}"
+                                    elif self.disable_coding_agent:
+                                        observation = f"Observation {self.step_n}: Coding agent disabled by ablation."
+                                else:
+                                    # majority voting among tool results and llm results
+                                    if new_ob != []:
+                                        new_ob = [
+                                            f'Observation {self.step_n}: {item}' for item in new_ob]
+                                        new_ob += all_observations
+                                        observation = Counter(
+                                            new_ob).most_common(1)[0][0]
+                                    elif self.disable_coding_agent:
+                                        observation = f"Observation {self.step_n}: Coding agent disabled by ablation."
+
+                        elif action_type == "Retrieve":
+                            if self.disable_coding_agent:
+                                observation = f"Observation {self.step_n}: Coding agent disabled by ablation."
+                            else:
+                                new_ob = self.retriever_tool(
+                                    instruction=argument)
                                 if new_ob != []:
                                     new_ob = [
                                         f'Observation {self.step_n}: {item}' for item in new_ob]
-                                    new_ob += all_observations
+                                    if not self.long_table and not self.code_as_observation:
+                                        new_ob += all_observations
                                     observation = Counter(
                                         new_ob).most_common(1)[0][0]
 
-                        elif action_type == "Retrieve":
-                            new_ob = self.retriever_tool(
-                                instruction=argument)
-                            if new_ob != []:
-                                new_ob = [
-                                    f'Observation {self.step_n}: {item}' for item in new_ob]
-                                if not self.long_table and not self.code_as_observation:
-                                    new_ob += all_observations
-                                observation = Counter(
-                                    new_ob).most_common(1)[0][0]
-
                         elif action_type == "Search":
-                            if self.without_tool:
+                            if self.disable_search:
+                                observation = f"Observation {self.step_n}: Search tool disabled by ablation."
+                            elif self.without_tool:
                                 pass
                             else:
                                 try:
@@ -1109,11 +1147,16 @@ class ReactAgent:
                                     # cannot find on wikipedia, use llm search results
                                     pass
                         elif action_type == "Operate":
-                            recent_table_df = self.table_dfs[-1]
-                            new_ob = self.calculator_tool(
-                                argument, recent_table_df=recent_table_df)
-                            if new_ob != "":
-                                observation = f"Observation {self.step_n}: {new_ob}"
+                            if self.disable_calculate:
+                                observation = f"Observation {self.step_n}: Calculate tool disabled by ablation."
+                            else:
+                                recent_table_df = self.table_dfs[-1]
+                                new_ob = self.calculator_tool(
+                                    argument, recent_table_df=recent_table_df)
+                                if new_ob != "":
+                                    observation = f"Observation {self.step_n}: {new_ob}"
+                                elif self.disable_coding_agent:
+                                    observation = f"Observation {self.step_n}: Coding agent disabled by ablation."
 
                         elif action_type == "Verify" and self.use_verifier:
                             verification = self.verifier_tool(argument)
