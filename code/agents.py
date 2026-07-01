@@ -26,6 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import json
+import os
 import re
 import string
 from collections import Counter, OrderedDict, defaultdict
@@ -54,6 +55,7 @@ from utils import (extract_from_outputs, parse_action, table2df,
                    table_linear)
 
 all_input_token, all_output_token = 0, 0
+_LOGGED_DATASET_HINTS = set()
 
 
 class SimpleWikipediaSearch:
@@ -245,6 +247,7 @@ class ReactAgent:
         self.llm_sampled = []
         self.code_sampled = []
         self.direct_sampled = []
+        self.dataset_hint = self._load_dataset_hint(task)
 
         if not self.direct_reasoning:
             if task == "tat":
@@ -376,6 +379,64 @@ class ReactAgent:
             eqution = eqution.replace(",", "")
             eqution = eqution.replace("$", "")
             return eqution
+
+        def recent_table_row_count(table_df):
+            try:
+                if isinstance(table_df, pd.DataFrame):
+                    return len(table_df)
+                if isinstance(table_df, str):
+                    loc = {}
+                    exec(table_df, globals(), loc)
+                    df = loc.get("df")
+                    if isinstance(df, pd.DataFrame):
+                        return len(df)
+            except Exception:
+                pass
+            return None
+
+        def should_count_recent_rows(instruction):
+            text = str(instruction).lower()
+            if "count" not in text:
+                return False
+            grouped_count_terms = [
+                "count each",
+                "count by",
+                "frequency",
+                "frequencies",
+                "unique",
+                "distinct",
+            ]
+            if any(term in text for term in grouped_count_terms):
+                return False
+            scoped_to_recent = any(
+                term in text
+                for term in [
+                    "observation",
+                    "recent table",
+                    "retrieved",
+                    "listed",
+                    "matching rows",
+                ]
+            )
+            row_like = any(
+                term in text
+                for term in [
+                    "row",
+                    "rows",
+                    "entry",
+                    "entries",
+                    "item",
+                    "items",
+                    "number of",
+                ]
+            )
+            return scoped_to_recent and row_like
+
+        if should_count_recent_rows(eqution):
+            row_count = recent_table_row_count(recent_table_df)
+            if row_count is not None:
+                return row_count
+
         try:
             eqution = clean_eqution(eqution)
             loc = {}
@@ -643,7 +704,7 @@ class ReactAgent:
             except:
                 most_common = ""
                 num_most_common = 0
-            if num_most_common > threshold:
+            if num_most_common >= threshold:
                 pre_ans = most_common
             assert len(pre_answers) == len(mapping)
             return pre_ans, pre_answers, mapping
@@ -891,6 +952,8 @@ class ReactAgent:
 
     def _build_control_context(self):
         control_context = ""
+        if self.dataset_hint:
+            control_context += self.dataset_hint + "\n"
         if self.use_router:
             if self.question_profile is None:
                 self.question_profile = self._default_question_profile()
@@ -1047,15 +1110,14 @@ class ReactAgent:
 
         if not self.answer:
             if self.use_pre_answer:
-                try:
-                    self.answer = Counter(
-                        self.pre_ans_all).most_common(1)[0][0]
-                except:
-                    # direct prompting
-                    self.answer = self.get_quick_answer()
+                valid_pre_answers = self._valid_pre_answers()
+                if valid_pre_answers:
+                    self.answer = Counter(valid_pre_answers).most_common(1)[0][0]
+                else:
+                    self.answer = self._get_safe_quick_answer()
             else:
                 # direct prompting
-                self.answer = self.get_quick_answer()
+                self.answer = self._get_safe_quick_answer()
 
     def step(self) -> None:
         if self.direct_reasoning:
@@ -1089,7 +1151,12 @@ class ReactAgent:
             self.actual_step_n += 1
             thought, action, observation, all_observations = self.as_reward_fn(
                 sampled)
-            if self.use_pre_answer and self.pre_ans and not self.use_verifier:
+            if (
+                self.use_pre_answer
+                and self.pre_ans
+                and not self._is_action_like_answer(self.pre_ans)
+                and not self.use_verifier
+            ):
                 self.finished = True
                 self.answer = self.pre_ans
             else:
@@ -1161,6 +1228,17 @@ class ReactAgent:
                         elif action_type == "Verify" and self.use_verifier:
                             verification = self.verifier_tool(argument)
                             observation = f"Observation {self.step_n}: {verification}"
+
+                        if (
+                            observation == ""
+                            and action_type in ["Retrieve", "Calculate", "Operate"]
+                        ):
+                            observation = (
+                                f"Observation {self.step_n}: No valid observation was "
+                                "produced by the tool. Retry with a more specific action, "
+                                "or finish only if the answer is directly supported by the "
+                                "table/context already shown."
+                            )
 
                         if observation != "":
                             self.scratchpad += thought + "\n"
@@ -1281,6 +1359,69 @@ class ReactAgent:
                 question=self.question,
                 scratchpad=scratchpad)
 
+    def _load_dataset_hint(self, task):
+        task = str(task).strip().lower()
+        if not task:
+            return ""
+        hint_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "prompts",
+            "dataset_hints",
+            f"{task}_reasoning_hints.txt",
+        )
+        try:
+            with open(hint_path, "r", encoding="utf-8") as input_file:
+                hint = input_file.read().strip()
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            print(f"==============dataset hint warning===========")
+            print(f"Failed to load dataset hint from {hint_path}: {exc}")
+            return ""
+
+        if hint and hint_path not in _LOGGED_DATASET_HINTS:
+            print("==============dataset hint loaded===========")
+            print(f"Task: {task}")
+            print(f"Path: {hint_path}")
+            print(hint)
+            _LOGGED_DATASET_HINTS.add(hint_path)
+        return hint
+
+    def _valid_pre_answers(self):
+        return [
+            answer
+            for answer in self.pre_ans_all
+            if not self._is_action_like_answer(answer)
+        ]
+
+    def _get_safe_quick_answer(self):
+        answer = self.get_quick_answer()
+        if self._is_action_like_answer(answer):
+            print("==============answer fallback warning===========")
+            print(f"Rejected action-like quick answer: {answer}")
+            return "N/A"
+        return answer
+
+    def _is_action_like_answer(self, answer):
+        if answer is None:
+            return True
+        text = str(answer).strip().lower()
+        if not text:
+            return True
+        action_prefixes = (
+            "retrieve ",
+            "retrieve[",
+            "calculate ",
+            "calculate[",
+            "search ",
+            "search[",
+            "operate ",
+            "operate[",
+            "verify ",
+            "verify[",
+        )
+        return text.startswith(action_prefixes)
+
     def is_finished(self) -> bool:
         return self.finished
 
@@ -1297,6 +1438,7 @@ class ReactAgent:
         self.actual_step_n = 1
         self.finished = False
         self.scratchpad: str = ''
+        self.pre_ans = None
         self.verification_cache = {}
 
     def set_qa(self, question: str, key: str) -> None:

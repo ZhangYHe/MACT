@@ -129,7 +129,7 @@ REACT_INSTRUCTION_TAT = """Solve a table question answering task with interleavi
 (1) Retrieve[cells], which retrieves certain cell(s) from the table and returns the retrieved cells in string format.
 (2) Look up[information], which looks up the information in the context (if any) and returns the information in string format.
 (3) Calculate[formular/instruction], which carries out calculations based on the formular, or the instruction and returns the calculated results.
-(4) Finish[answer], which returns the answer and finishes the task.
+(4) Finish[answer], which returns only the final answer and finishes the task. Do not include explanations in Finish. If the answer contains multiple items, return them as structured separate items instead of a prose sentence.
 You may take as many steps as necessary.
 Here are some examples:
 {examples}
@@ -145,7 +145,7 @@ REACT_INSTRUCTION_WTQ = """Solve a table question answering task with interleavi
 (1) Retrieve[cells], which retrieves certain cell(s) from the table and returns the retrieved cells in string format.
 (2) Calculate[formular/instruction], which carries out calculations based on the formular, or the instruction and returns the calculated results.
 (3) Search[entity], which searches the exact entity on Wikipedia and returns the first paragraph if it exists.
-(4) Finish[answer], which returns the answer and finishes the task.
+(4) Finish[answer], which returns only the final answer and finishes the task. Do not include explanations in Finish. If the answer contains multiple items, return them as structured separate items instead of a prose sentence.
 You may take as many steps as necessary.
 Here are some examples:
 {examples}
@@ -161,7 +161,7 @@ REACT_INSTRUCTION_CRT = """Solve a table question answering task with interleavi
 (1) Retrieve[cells], which retrieves certain cell(s) from the table and returns the retrieved cells in string format.
 (2) Calculate[formular/instruction], which carries out calculations based on the formular, or the instruction and returns the calculated results.
 (3) Search[entity], which searches the exact entity on Wikipedia and returns the first paragraph if it exists.
-(4) Finish[answer], which returns the answer and finishes the task.
+(4) Finish[answer], which returns only the final answer and finishes the task. Do not include explanations in Finish. If the answer contains multiple items, return them as structured separate items instead of a prose sentence.
 You may take as many steps as necessary.
 Here are some examples:
 {examples}
@@ -178,7 +178,7 @@ REACT_INSTRUCTION_SCITAB = """Solve a table question answering task with interle
 (1) Retrieve[cells], which retrieves certain cell(s) from the table and returns the retrieved cells in string format.
 (2) Calculate[formular/instruction], which carries out calculations based on the formular, or the instruction and returns the calculated results.
 (3) Search[entity], which searches the exact entity on Wikipedia and returns the first paragraph if it exists.
-(4) Finish[answer], which returns the answer and finishes the task.
+(4) Finish[answer], which returns only the final answer and finishes the task. Do not include explanations in Finish. If the answer contains multiple items, return them as structured separate items instead of a prose sentence.
 You may take as many steps as necessary.
 Here are some examples:
 {examples}
@@ -193,7 +193,7 @@ Context: {context}
 
 REACT_INSTRUCTION_DATABENCH = """Solve a table question answering task with interleaving Thought, Action, Observation steps. Thought can reason about the current situation, and Action can be two types: 
 (1) Operate[instruction], which carries out operations such as information retrieval or calculations based on the instruction and returns the retrieved or calculated results.
-(2) Finish[answer], which returns the answer and finishes the task.
+(2) Finish[answer], which returns only the final answer and finishes the task. Do not include explanations in Finish. If the answer contains multiple items, return them as structured separate items instead of a prose sentence.
 You may take as many steps as necessary.
 Here are some examples:
 {examples}

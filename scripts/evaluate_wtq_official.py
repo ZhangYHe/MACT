@@ -9,6 +9,7 @@ writes a prediction TSV that mirrors the official evaluator input format.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -216,6 +217,10 @@ def tsv_unescape_list(value: str) -> list[str]:
     return [tsv_unescape(part) for part in value.split("|")]
 
 
+def tsv_escape(value: object) -> str:
+    return str(value).replace("\\", r"\\").replace("\n", r"\n").replace("|", r"\p")
+
+
 def load_target_values(tagged_dataset_path: Path) -> dict[str, list[Value]]:
     if not tagged_dataset_path.is_dir():
         raise FileNotFoundError(f"Tagged dataset directory does not exist: {tagged_dataset_path}")
@@ -249,6 +254,37 @@ def prediction_to_string(prediction: object) -> str:
     return str(prediction)
 
 
+def prediction_to_items(prediction: object) -> list[object]:
+    if prediction is None:
+        return []
+    if isinstance(prediction, (list, tuple)):
+        return list(prediction)
+    if not isinstance(prediction, str):
+        return [prediction]
+
+    text = prediction.strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        for parser in (ast.literal_eval, json.loads):
+            try:
+                parsed = parser(text)
+            except Exception:
+                continue
+            if isinstance(parsed, (list, tuple)):
+                return list(parsed)
+
+    if "|" in text:
+        return tsv_unescape_list(text)
+
+    return [prediction]
+
+
+def prediction_to_tsv_string(prediction: object) -> str:
+    return "|".join(tsv_escape(item) for item in prediction_to_items(prediction))
+
+
 def load_results(result_jsonl: Path) -> list[dict]:
     if not result_jsonl.is_file():
         raise FileNotFoundError(f"Result JSONL does not exist: {result_jsonl}")
@@ -269,7 +305,7 @@ def write_prediction_tsv(results: list[dict], prediction_path: Path) -> None:
     prediction_path.parent.mkdir(parents=True, exist_ok=True)
     with prediction_path.open("w", encoding="utf-8") as output_file:
         for item in results:
-            prediction = prediction_to_string(item.get("pred_answer"))
+            prediction = prediction_to_tsv_string(item.get("pred_answer"))
             output_file.write(f"{item['id']}\t{prediction}\n")
 
 
@@ -286,7 +322,8 @@ def evaluate_results(
     for item in results:
         example_id = item["id"]
         prediction = prediction_to_string(item.get("pred_answer"))
-        predicted_values = [] if prediction == "" else to_value_list([prediction])
+        prediction_items = prediction_to_items(item.get("pred_answer"))
+        predicted_values = [] if not prediction_items else to_value_list(prediction_items)
 
         if example_id not in target_values_map:
             missing_ids.append(example_id)

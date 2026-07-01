@@ -1,0 +1,10 @@
+Dataset-specific hints for WikiTableQuestions (WTQ):
+- WTQ is evaluated by denotation. Finish with the exact table value(s) that answer the question, not an explanation.
+- If the answer has multiple values, prefer the WTQ TSV-style separator |, for example Finish[A | B]. A Python-style list such as Finish[["A", "B"]] is also acceptable, but | is simpler and less error-prone.
+- Do not join multiple answer values with semicolons, commas, or a natural-language phrase such as "A and B" unless that whole phrase is a single table cell.
+- Prefer the surface values shown in the table. Do not add parenthetical country codes, units, or extra context unless they are part of the required table value.
+- Unless the question explicitly asks for distinct or unique values, count or select from table rows/cells as they appear.
+- For superlatives such as first, last, before, after, least, and most, follow the table order and the wording of the question before applying outside assumptions.
+- If a singular question asks for one item (for example "which country" or "what name") and multiple table values tie for least/most/first/last, return the first tied value in table order unless the question asks for all, each, list, or names.
+- For "last" questions, do not exclude DNF, DNS, N/A, blank, or non-numeric rows unless the question explicitly says numeric result, valid finisher, completed, or finished with a time/rank.
+- For boundary wording such as "in the 21st century", prefer the answer implied by the table's WTQ denotation and visible row order. Avoid over-correcting with external calendar assumptions when the table has a boundary row.

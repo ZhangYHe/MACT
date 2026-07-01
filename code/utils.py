@@ -136,25 +136,43 @@ def dfcode2str(dfcode):
 
 
 def parse_action(string):
-    first_action = re.search(
-        r'(Retrieve|Operate|Finish|Search|Calculate|Verify)\[.+?\]', string)
-    if first_action and first_action.group(0).startswith("Verify["):
-        actions = [first_action.group(0)]
-    else:
-        actions = re.findall(r'Retrieve\[.+?\]', string)+re.findall(r'Operate\[.+?\]', string)+re.findall(
-            r'Finish\[.+?\]', string)+re.findall(r'Search\[.+?\]', string)+re.findall(r'Calculate\[.+?\]', string)+re.findall(r'Verify\[.+?\]', string)
-    if actions:
-        action = actions[0]
-        pattern = r'^(\w+)\[(.+)\]$'
-        match = re.match(pattern, action)
-        if match:
-            action_type = match.group(1)
-            argument = match.group(2)
-            return action_type, argument
-        else:
-            return None, None
-    else:
+    first_action = None
+    for match in re.finditer(r'\b(Retrieve|Operate|Finish|Search|Calculate|Verify)\[', string):
+        if first_action is None or match.start() < first_action.start():
+            first_action = match
+
+    if first_action is None:
         return None, None
+
+    action_type = first_action.group(1)
+    argument_start = first_action.end()
+    depth = 1
+    quote = None
+    escaped = False
+
+    for index in range(argument_start, len(string)):
+        char = string[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return action_type, string[argument_start:index]
+
+    return None, None
 
 
 def extract_from_outputs(outputs, num_choices):
