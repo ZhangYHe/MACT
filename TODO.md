@@ -1,0 +1,2 @@
+- scitab few shot不是原始标签而是ture/false
+- 检查wtq等有没有用到table title
