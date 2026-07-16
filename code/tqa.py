@@ -86,6 +86,18 @@ def default_env_file():
     return os.path.join(project_root, ".env")
 
 
+def resolve_row_task(row, cli_task):
+    if cli_task not in {"auto", "mixed"}:
+        return cli_task
+    row_task = str(row.get("task", "")).strip().lower()
+    if row_task not in {"wtq", "crt", "tat", "scitab"}:
+        raise ValueError(
+            "--task auto requires each dataset row to include task as one of "
+            "wtq, crt, tat, or scitab."
+        )
+    return row_task
+
+
 def main(args):
     load_dotenv(args.env_file, override=True)
     plan_backend = resolve_backend(args.plan_backend, args.plan_model_name)
@@ -120,45 +132,57 @@ def main(args):
 
     trial = 0
     agent_cls = ReactAgent
-    agents = [agent_cls(question=row["question"] if "question" in list(row.keys()) else row["statement"],
-              table=get_databench_table(args.table_dir, row["dataset"])[
-        0] if args.task == "databench" else row["table_text"],
-        table_df=table2df(get_databench_table(args.table_dir, row["dataset"])[
-            1]) if args.task == "databench" else table2df(row["table_text"]),
-        df_path=get_databench_table(args.table_dir, row["dataset"])[
-        2] if args.task == "databench" else None,
-        context=row["text"] if "text" in list(row.keys()) else "",
-        key=row["answer"] if "answer" in list(row.keys()) else "none",
-        answer="",
-        max_steps=args.max_step,
-        max_actual_steps=args.max_actual_step,
-        plan_model_name=args.plan_model_name,
-        code_model_name=args.code_model_name,
-        model=model,
-        tokenizer=tokenizer,
-        task=args.task,
-        codeagent_endpoint=codeagent_endpoint,
-        as_reward=args.as_reward,
-        plan_sample=args.plan_sample,
-        code_sample=args.code_sample,
-        use_pre_answer=args.use_pre_answer,
-        answer_aggrement=args.answer_aggregate,
-        direct_reasoning=args.direct_reasoning,
-        long_table_op=args.long_table_op,
-        debugging=args.debugging,
-        client=client,
-        plan_backend=plan_backend,
-        code_backend=code_backend,
-        code_as_observation=args.code_as_observation,
-        without_tool=args.without_tool,
-        use_router=args.use_router,
-        use_verifier=args.use_verifier,
-        use_repair=args.use_repair,
-        use_code_repair=args.use_code_repair,
-        disable_search=args.disable_search,
-        disable_calculate=args.disable_calculate,
-        disable_coding_agent=args.disable_coding_agent,
-        log_router=args.log_router) for _, row in enumerate(table_dataset)]
+    agents = []
+    for _, row in enumerate(table_dataset):
+        row_task = resolve_row_task(row, args.task)
+        if row_task == "databench":
+            databench_table = get_databench_table(args.table_dir, row["dataset"])
+            table = databench_table[0]
+            table_df = table2df(databench_table[1])
+            df_path = databench_table[2]
+        else:
+            table = row["table_text"]
+            table_df = table2df(row["table_text"])
+            df_path = None
+
+        agents.append(agent_cls(
+            question=row["question"] if "question" in list(row.keys()) else row["statement"],
+            table=table,
+            table_df=table_df,
+            df_path=df_path,
+            context=row["text"] if "text" in list(row.keys()) else "",
+            key=row["answer"] if "answer" in list(row.keys()) else "none",
+            answer="",
+            max_steps=args.max_step,
+            max_actual_steps=args.max_actual_step,
+            plan_model_name=args.plan_model_name,
+            code_model_name=args.code_model_name,
+            model=model,
+            tokenizer=tokenizer,
+            task=row_task,
+            codeagent_endpoint=codeagent_endpoint,
+            as_reward=args.as_reward,
+            plan_sample=args.plan_sample,
+            code_sample=args.code_sample,
+            use_pre_answer=args.use_pre_answer,
+            answer_aggrement=args.answer_aggregate,
+            direct_reasoning=args.direct_reasoning,
+            long_table_op=args.long_table_op,
+            debugging=args.debugging,
+            client=client,
+            plan_backend=plan_backend,
+            code_backend=code_backend,
+            code_as_observation=args.code_as_observation,
+            without_tool=args.without_tool,
+            use_router=args.use_router,
+            use_verifier=args.use_verifier,
+            use_repair=args.use_repair,
+            use_code_repair=args.use_code_repair,
+            disable_search=args.disable_search,
+            disable_calculate=args.disable_calculate,
+            disable_coding_agent=args.disable_coding_agent,
+            log_router=args.log_router,
+        ))
     if args.debugging:
         agents = agents[0:1]
         for idx, agent in enumerate([a for a in agents]):
@@ -189,7 +213,7 @@ def main(args):
                     f'Finished Trial {trial}, Correct: {len(correct)}, Incorrect: {len(incorrect)}, Halted: {len(halted)}')
             except Exception as e:
                 print(traceback.format_exc())
-                break
+                raise
 
 
 if __name__ == '__main__':
@@ -227,7 +251,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_actual_step', type=int, default=6,
                         help="maximum number for all iterations.")
     parser.add_argument('--task', type=str, default="wtq",
-                        choices=["wtq", "crt", "tat", "scitab", "databench"])
+                        choices=["wtq", "crt", "tat", "scitab", "databench", "auto", "mixed"])
     parser.add_argument('--as_reward', type=str, default="consistency",
                         choices=["consistency", "llm", "logp", "rollout", "combined"])
     parser.add_argument('--long_table_op', type=str, default="ignore",

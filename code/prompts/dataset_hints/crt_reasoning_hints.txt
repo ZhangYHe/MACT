@@ -1,0 +1,8 @@
+Dataset-specific hints for CRT-QA:
+- CRT-QA questions are answerable table questions in this prompt-dev split. Finish with the exact answer value(s), not an explanation.
+- Use the table title/context only as supporting context; prefer evidence from the table cells when selecting the final answer.
+- CRT-QA often requires combining multiple conditions across rows or columns. Check every stated constraint before finishing.
+- For comparison, ranking, before/after, max/min, or counting questions, preserve the table's row order unless the question explicitly asks for sorted numeric order.
+- If the answer has multiple values, return them as structured separate items or a simple separator form. Do not write a prose sentence such as "the answers are ...".
+- Do not add external facts from Search unless the question cannot be resolved from the table title and cells.
+- If several table cells look similar, use column headers and row labels to disambiguate before calculating or finishing.

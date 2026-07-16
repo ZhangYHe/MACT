@@ -29,6 +29,7 @@ import json
 import os
 import re
 import string
+import sys
 from collections import Counter, OrderedDict, defaultdict
 
 import pandas as pd
@@ -55,6 +56,7 @@ from utils import (extract_from_outputs, parse_action, table2df,
                    table_linear)
 
 all_input_token, all_output_token = 0, 0
+_WARNED_MISSING_USAGE = False
 _LOGGED_DATASET_HINTS = set()
 
 
@@ -76,7 +78,7 @@ class SimpleWikipediaSearch:
 
 
 def get_completion(prompt, client, n, model):
-    global all_input_token, all_output_token
+    global all_input_token, all_output_token, _WARNED_MISSING_USAGE
     messages = [{"role": "user", "content": prompt}]
     response = client.chat.completions.create(
         model=model,
@@ -89,12 +91,22 @@ def get_completion(prompt, client, n, model):
         n=n,
         stop=None
     )
-    input_token_num = response.usage.prompt_tokens
-    output_token_num = response.usage.completion_tokens
+    usage = getattr(response, "usage", None)
+    input_token_num = getattr(usage, "prompt_tokens", None) if usage else None
+    output_token_num = getattr(usage, "completion_tokens", None) if usage else None
+    if (input_token_num is None or output_token_num is None) and not _WARNED_MISSING_USAGE:
+        print(
+            "Warning: LLM response usage is missing prompt_tokens or completion_tokens; "
+            "token counters will use 0 for missing values.",
+            file=sys.stderr,
+        )
+        _WARNED_MISSING_USAGE = True
+    input_token_num = input_token_num or 0
+    output_token_num = output_token_num or 0
     all_input_token += input_token_num
     all_output_token += output_token_num
     # print(all_input_token, all_output_token)
-    return [item.message.content for item in response.choices]
+    return [item.message.content or "" for item in response.choices]
 
 
 @function

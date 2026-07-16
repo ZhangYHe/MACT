@@ -1,0 +1,8 @@
+{
+  "plan_backend": "openai",
+  "code_backend": "openai",
+  "plan_model_name": "Qwen3.5-9B",
+  "code_model_name": "Qwen3.5-9B",
+  "api_key": "EMPTY",
+  "base_url": "http://127.0.0.1:12190/v1"
+}

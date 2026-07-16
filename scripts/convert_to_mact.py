@@ -77,6 +77,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include id, dataset, split, and table_id in each output item.",
     )
+    parser.add_argument(
+        "--include_task",
+        action="store_true",
+        help="Include the converter task name in each output item.",
+    )
+    parser.add_argument(
+        "--exclude_ids_path",
+        action="append",
+        default=[],
+        help=(
+            "JSONL file containing ids to exclude. Can be passed multiple times. "
+            "Rows without an id are ignored."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -618,14 +632,27 @@ def prepare_examples(
     shuffle: bool,
     seed: int,
     include_metadata: bool,
+    task: str | None = None,
+    include_task: bool = False,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict]:
     if limit is not None and limit < 0:
         raise ValueError(f"--limit must be non-negative, got {limit}")
 
-    selected = list(examples)
+    exclude_ids = exclude_ids or set()
+    selected = [
+        example
+        for example in examples
+        if str(example.get("_metadata", {}).get("id", "")) not in exclude_ids
+    ]
     if shuffle:
         random.Random(seed).shuffle(selected)
     if limit is not None:
+        if len(selected) < limit:
+            raise ValueError(
+                f"Requested {limit} examples, but only {len(selected)} remain "
+                "after applying exclusions."
+            )
         selected = selected[:limit]
 
     output_examples = []
@@ -638,9 +665,34 @@ def prepare_examples(
         item.update(example.get("_extra", {}))
         if include_metadata:
             item.update(example["_metadata"])
+        if include_task:
+            item["task"] = task
         output_examples.append(item)
 
     return output_examples
+
+
+def load_excluded_ids(paths: list[str]) -> set[str]:
+    excluded_ids = set()
+    for path_text in paths:
+        path = Path(path_text).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"Exclude ids file does not exist: {path}")
+        with path.open("r", encoding="utf-8") as input_file:
+            for line_number, line in enumerate(input_file, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSON in {path} at line {line_number}: {exc}"
+                    ) from exc
+                item_id = item.get("id")
+                if item_id is not None:
+                    excluded_ids.add(str(item_id))
+    return excluded_ids
 
 
 def write_jsonl(examples: list[dict], output_path: Path) -> None:
@@ -661,6 +713,9 @@ def main() -> None:
         shuffle=args.shuffle,
         seed=args.seed,
         include_metadata=args.include_metadata,
+        task=args.task,
+        include_task=args.include_task,
+        exclude_ids=load_excluded_ids(args.exclude_ids_path),
     )
     write_jsonl(output_examples, output_path)
 

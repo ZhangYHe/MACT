@@ -1,0 +1,8 @@
+{
+  "plan_backend": "openai",
+  "code_backend": "openai",
+  "plan_model_name": "gpt-5",
+  "code_model_name": "gpt-5",
+  "api_key": "",
+  "base_url": ""
+}

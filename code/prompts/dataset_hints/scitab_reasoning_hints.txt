@@ -1,0 +1,8 @@
+Dataset-specific hints for SciTab:
+- SciTab is a claim verification task over scientific tables. The final answer must be exactly one label: supports, refutes, or not enough info.
+- Read the claim first, then compare every quantitative value, trend, entity, condition, and unit in the claim against the table and caption.
+- Use supports only when the table directly entails the claim.
+- Use refutes when the table directly contradicts the claim.
+- Use not enough info when the table and caption do not provide enough evidence to prove or disprove the claim.
+- Do not answer with yes/no, true/false, explanations, or a rewritten claim in Finish.
+- Be careful with approximate values, units, column labels, row labels, experimental settings, and comparison direction.
