@@ -51,6 +51,12 @@ def write_to_file(path, agent, idx, new_table_dataset, given_plan):
         item["pred_answer"] = pred_answer
         item["history"] = agent.scratchpad
         item["pred_answer_all"] = agent.pre_ans_all
+        item["run_status"] = agent.run_status
+        item["parse_failures"] = agent.parse_failures
+        item["fallback_answer"] = agent.fallback_answer
+        item["fallback_rejected_reason"] = agent.fallback_rejected_reason
+        item["direct_answer_candidate"] = agent.direct_answer_candidate
+        item["direct_answer_candidate_verification"] = agent.direct_answer_candidate_verification
         # item["code_log"] = agent.generated_code
         # item["plan_log"] = agent.generated_plan
         f.write(json.dumps(item)+"\n")
@@ -132,6 +138,11 @@ def main(args):
 
     trial = 0
     agent_cls = ReactAgent
+    plan_model_name = args.plan_model_name.split("/")[-1].strip()
+    code_model_name = args.code_model_name.split("/")[-1].strip()
+    output_path = args.output_path or f"{args.task}_{plan_model_name}_{code_model_name}_{args.as_reward}_{args.plan_sample}_{args.code_sample}_direct_{args.direct_reasoning}_{args.answer_aggregate}.json"
+    if args.debug_llm_io and not args.debug_log_path:
+        args.debug_log_path = f"{output_path}.llm_debug.jsonl"
     agents = []
     for _, row in enumerate(table_dataset):
         row_task = resolve_row_task(row, args.task)
@@ -182,6 +193,12 @@ def main(args):
             disable_calculate=args.disable_calculate,
             disable_coding_agent=args.disable_coding_agent,
             log_router=args.log_router,
+            example_id=row.get("id", ""),
+            debug_llm_io=args.debug_llm_io,
+            debug_full_prompt=args.debug_full_prompt,
+            debug_log_path=args.debug_log_path,
+            openai_max_tokens=args.openai_max_tokens,
+            openai_temperature=args.openai_temperature,
         ))
     if args.debugging:
         agents = agents[0:1]
@@ -198,9 +215,6 @@ def main(args):
                     Incorrect: {len(incorrect)}, Halted: {len(halted)}')
     else:
         finished_agents = []
-        plan_model_name = args.plan_model_name.split("/")[-1].strip()
-        code_model_name = args.code_model_name.split("/")[-1].strip()
-        output_path = args.output_path or f"{args.task}_{plan_model_name}_{code_model_name}_{args.as_reward}_{args.plan_sample}_{args.code_sample}_direct_{args.direct_reasoning}_{args.answer_aggregate}.json"
         for idx, agent in enumerate([a for a in agents]):
             try:
                 finished_agent = write_to_file(
@@ -271,6 +285,16 @@ if __name__ == '__main__':
     parser.add_argument('--code_endpoint', default="11039",
                         help="coding agent port.")
     parser.add_argument('--debugging', action='store_true')
+    parser.add_argument('--debug_llm_io', action='store_true',
+                        help="write raw LLM call diagnostics as JSONL for debugging.")
+    parser.add_argument('--debug_full_prompt', action='store_true',
+                        help="include full prompts in --debug_llm_io JSONL logs.")
+    parser.add_argument('--debug_log_path', default="",
+                        help="path for --debug_llm_io JSONL logs. Defaults to output_path.llm_debug.jsonl.")
+    parser.add_argument('--openai_max_tokens', type=int, default=2000,
+                        help="max visible output tokens for OpenAI Chat Completions calls.")
+    parser.add_argument('--openai_temperature', type=float, default=0.6,
+                        help="temperature for OpenAI Chat Completions calls.")
     parser.add_argument('--code_as_observation', action='store_true',
                         help="only use code as the final observations or not.")
     parser.add_argument('--use_router', action='store_true',

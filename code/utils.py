@@ -163,6 +163,10 @@ def parse_action(string):
                 quote = None
             continue
         if char in {"'", '"'}:
+            previous_char = string[index - 1] if index > argument_start else ""
+            next_char = string[index + 1] if index + 1 < len(string) else ""
+            if char == "'" and previous_char.isalnum() and next_char.isspace():
+                continue
             quote = char
             continue
         if char == "[":

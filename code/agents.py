@@ -30,6 +30,7 @@ import os
 import re
 import string
 import sys
+import hashlib
 from collections import Counter, OrderedDict, defaultdict
 
 import pandas as pd
@@ -58,6 +59,8 @@ from utils import (extract_from_outputs, parse_action, table2df,
 all_input_token, all_output_token = 0, 0
 _WARNED_MISSING_USAGE = False
 _LOGGED_DATASET_HINTS = set()
+DEFAULT_OPENAI_MAX_TOKENS = 2000
+OPENAI_EMPTY_LENGTH_RETRY_MAX_TOKENS = 4000
 
 
 class SimpleWikipediaSearch:
@@ -77,36 +80,158 @@ class SimpleWikipediaSearch:
             raise
 
 
-def get_completion(prompt, client, n, model):
+def _safe_model_dump(obj):
+    if obj is None:
+        return {}
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    if hasattr(obj, "__dict__"):
+        return {
+            key: value
+            for key, value in obj.__dict__.items()
+            if not key.startswith("_")
+        }
+    return {}
+
+
+def get_completion(
+    prompt,
+    client,
+    n,
+    model,
+    phase="",
+    step_n=None,
+    debug_logger=None,
+    debug_full_prompt=False,
+    max_tokens=DEFAULT_OPENAI_MAX_TOKENS,
+    temperature=0.6,
+    retry_empty_length=True,
+):
     global all_input_token, all_output_token, _WARNED_MISSING_USAGE
     messages = [{"role": "user", "content": prompt}]
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.6,
-        max_tokens=400,
-        top_p=0.95,
-        frequency_penalty=0,
-        presence_penalty=0,
-        n=n,
-        stop=None
-    )
+
+    def create_response(token_budget):
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=token_budget,
+            top_p=0.95,
+            frequency_penalty=0,
+            presence_penalty=0,
+            n=n,
+            stop=None
+        )
+
+    response = create_response(max_tokens)
+    retry_reason = ""
+    if retry_empty_length and _is_empty_length_response(response):
+        retry_reason = (
+            f"empty content with finish_reason=length; retrying with "
+            f"max_tokens={OPENAI_EMPTY_LENGTH_RETRY_MAX_TOKENS}"
+        )
+        if debug_logger is not None:
+            _log_completion_debug(
+                response=response,
+                prompt=prompt,
+                model=model,
+                n=n,
+                phase=phase,
+                step_n=step_n,
+                debug_logger=debug_logger,
+                debug_full_prompt=debug_full_prompt,
+                warning=retry_reason,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                retry_attempt=0,
+            )
+        response = create_response(max(max_tokens * 2, OPENAI_EMPTY_LENGTH_RETRY_MAX_TOKENS))
     usage = getattr(response, "usage", None)
     input_token_num = getattr(usage, "prompt_tokens", None) if usage else None
     output_token_num = getattr(usage, "completion_tokens", None) if usage else None
-    if (input_token_num is None or output_token_num is None) and not _WARNED_MISSING_USAGE:
-        print(
-            "Warning: LLM response usage is missing prompt_tokens or completion_tokens; "
-            "token counters will use 0 for missing values.",
-            file=sys.stderr,
-        )
+    missing_usage = input_token_num is None or output_token_num is None
+    warning = (
+        "LLM response usage is missing prompt_tokens or completion_tokens; "
+        "token counters will use 0 for missing values."
+    ) if missing_usage else ""
+    if missing_usage and not _WARNED_MISSING_USAGE:
+        print(f"Warning: {warning}", file=sys.stderr)
         _WARNED_MISSING_USAGE = True
     input_token_num = input_token_num or 0
     output_token_num = output_token_num or 0
     all_input_token += input_token_num
     all_output_token += output_token_num
     # print(all_input_token, all_output_token)
+    if debug_logger is not None:
+        _log_completion_debug(
+            response=response,
+            prompt=prompt,
+            model=model,
+            n=n,
+            phase=phase,
+            step_n=step_n,
+            debug_logger=debug_logger,
+            debug_full_prompt=debug_full_prompt,
+            warning="; ".join(item for item in [warning, retry_reason] if item),
+            max_tokens=max(max_tokens * 2, OPENAI_EMPTY_LENGTH_RETRY_MAX_TOKENS)
+            if retry_reason else max_tokens,
+            temperature=temperature,
+            retry_attempt=1 if retry_reason else 0,
+        )
     return [item.message.content or "" for item in response.choices]
+
+
+def _is_empty_length_response(response):
+    choices = getattr(response, "choices", []) or []
+    if not choices:
+        return False
+    for item in choices:
+        content = getattr(getattr(item, "message", None), "content", None) or ""
+        if content.strip() or getattr(item, "finish_reason", None) != "length":
+            return False
+    return True
+
+
+def _log_completion_debug(
+    response,
+    prompt,
+    model,
+    n,
+    phase,
+    step_n,
+    debug_logger,
+    debug_full_prompt,
+    warning,
+    max_tokens,
+    temperature,
+    retry_attempt,
+):
+    choices = []
+    for index, item in enumerate(getattr(response, "choices", []) or []):
+        content = getattr(getattr(item, "message", None), "content", None) or ""
+        choices.append({
+            "index": index,
+            "finish_reason": getattr(item, "finish_reason", None),
+            "content_len": len(content),
+            "content_preview": content[:1000],
+        })
+    debug_logger({
+        "phase": phase,
+        "step_n": step_n,
+        "model": model,
+        "n": n,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "retry_attempt": retry_attempt,
+        "prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_preview": prompt[:1000],
+        "prompt": prompt if debug_full_prompt else None,
+        "raw_choices": choices,
+        "usage": _safe_model_dump(getattr(response, "usage", None)),
+        "warning": warning,
+    })
 
 
 @function
@@ -196,7 +321,13 @@ class ReactAgent:
                  disable_search=False,
                  disable_calculate=False,
                  disable_coding_agent=False,
-                 log_router=True
+                 log_router=True,
+                 example_id="",
+                 debug_llm_io=False,
+                 debug_full_prompt=False,
+                 debug_log_path="",
+                 openai_max_tokens=DEFAULT_OPENAI_MAX_TOKENS,
+                 openai_temperature=0.6,
                  ) -> None:
 
         vllm = model
@@ -210,6 +341,12 @@ class ReactAgent:
         self.disable_calculate = disable_calculate
         self.disable_coding_agent = disable_coding_agent
         self.log_router = log_router
+        self.example_id = example_id
+        self.debug_llm_io = debug_llm_io
+        self.debug_full_prompt = debug_full_prompt
+        self.debug_log_path = debug_log_path
+        self.openai_max_tokens = openai_max_tokens
+        self.openai_temperature = openai_temperature
         self.question_profile = None
         self.verification_cache = {}
         if self.plan_backend == "local":
@@ -674,24 +811,7 @@ class ReactAgent:
         global all_input_token, all_output_token
 
         def get_current_step(instance):
-            current_thought, current_action, current_observation = "", "", ""
-            if instance:
-                instance_ = [line for line in instance.split(
-                    "\n") if line.strip() != ""]
-            try:
-                current_thought = [
-                    line for line in instance_ if f"Thought {self.step_n}:" in line][0]
-                current_action = [
-                    line for line in instance_ if f"Action {self.step_n}:" in line][0]
-                current_observation_start_id = [i for i, line in enumerate(
-                    instance_) if f"Observation {self.step_n}:" in line]
-                current_observation_end_id = [i for i, line in enumerate(
-                    instance_) if f"Thought {self.step_n+1}:" in line]
-                current_observation = "\n".join(
-                    instance_[current_observation_start_id[0]:current_observation_end_id[0]])
-            except:
-                pass
-            return current_thought, current_action, current_observation
+            return self._extract_current_step(instance)
 
         def get_preliminary_ans(sampled):
             mapping = []
@@ -867,10 +987,20 @@ class ReactAgent:
             result = str(result)
         return result
 
-    def _call_plan_llm_once(self, prompt):
+    def _call_plan_llm_once(self, prompt, phase=""):
         if self.plan_backend == "openai":
             return get_completion(
-                prompt, client=self.client, n=1, model=self.plan_model_name)[0]
+                prompt,
+                client=self.client,
+                n=1,
+                model=self.plan_model_name,
+                phase=phase,
+                step_n=self.step_n,
+                debug_logger=self._log_llm_io,
+                debug_full_prompt=self.debug_full_prompt,
+                max_tokens=self.openai_max_tokens,
+                temperature=self.openai_temperature,
+            )[0]
         return self.llm(prompt, num_return_sequences=1, return_prob=False)[0]
 
     def _extract_json_object(self, output):
@@ -945,6 +1075,149 @@ class ReactAgent:
             except Exception:
                 return []
 
+    def _log_llm_io(self, record):
+        if not self.debug_llm_io or not self.debug_log_path:
+            return
+        record = {
+            "example_id": self.example_id,
+            "task": self.task,
+            **record,
+        }
+        if record.get("prompt") is None:
+            record.pop("prompt", None)
+        log_dir = os.path.dirname(self.debug_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(self.debug_log_path, "a", encoding="utf-8") as output_file:
+            output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _strip_markdown_fence(self, text):
+        text = str(text or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        return text
+
+    def _normalize_direct_answer_candidate(self, text):
+        text = self._strip_markdown_fence(text)
+        if not text:
+            return ""
+        if "\n" in text:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if len(lines) == 1:
+                text = lines[0]
+            else:
+                answer_lines = [
+                    line for line in lines
+                    if re.match(r"^(?:final\s+)?answer\s*[:：]", line, flags=re.I)
+                ]
+                if len(answer_lines) == 1:
+                    text = re.split(r"[:：]", answer_lines[0], maxsplit=1)[-1].strip()
+                else:
+                    return ""
+        if re.match(r"^(?:final\s+)?answer\s*[:：]", text, flags=re.I):
+            text = re.split(r"[:：]", text, maxsplit=1)[-1].strip()
+        if re.search(r"\b(Thought|Action|Observation)\b", text, flags=re.I):
+            return ""
+        if re.search(r"\b(Retrieve|Operate|Finish|Search|Calculate|Verify)\s*\[", text):
+            return ""
+        if re.match(r"^(Retrieve|Operate|Search|Calculate|Verify)\b", text, flags=re.I):
+            return ""
+        if len(text) > 200:
+            return ""
+        return text.strip()
+
+    def _extract_current_step(self, instance):
+        current_thought, current_action, current_observation = "", "", ""
+        text = self._strip_markdown_fence(instance)
+        if not text:
+            return current_thought, current_action, current_observation
+
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        thought_pattern = re.compile(
+            rf"^(?:[-*]\s*)?Thought(?:\s+{self.step_n})?\s*[:\-]\s*(.*)$",
+            flags=re.I,
+        )
+        action_pattern = re.compile(
+            rf"^(?:[-*]\s*)?Action(?:\s+{self.step_n})?\s*[:\-]\s*(.*)$",
+            flags=re.I,
+        )
+        observation_pattern = re.compile(
+            rf"^(?:[-*]\s*)?Observation(?:\s+{self.step_n})?\s*[:\-]\s*(.*)$",
+            flags=re.I,
+        )
+        next_thought_pattern = re.compile(
+            rf"^(?:[-*]\s*)?Thought(?:\s+{self.step_n + 1})?\s*[:\-]",
+            flags=re.I,
+        )
+
+        observation_start = None
+        observation_end = None
+        for index, line in enumerate(lines):
+            thought_match = thought_pattern.match(line)
+            if thought_match and not current_thought:
+                current_thought = f"Thought {self.step_n}: {thought_match.group(1).strip()}"
+                continue
+            action_match = action_pattern.match(line)
+            if action_match and not current_action:
+                action_body = action_match.group(1).strip()
+                if parse_action(action_body)[0] is None:
+                    parsed_action = parse_action(line)
+                    if parsed_action[0] is not None:
+                        action_body = line[line.find(parsed_action[0]):].strip()
+                current_action = f"Action {self.step_n}: {action_body}"
+                continue
+            if observation_pattern.match(line) and observation_start is None:
+                observation_start = index
+            elif observation_start is not None and next_thought_pattern.match(line):
+                observation_end = index
+                break
+
+        if not current_action:
+            action_match = re.search(
+                r"\b(Retrieve|Operate|Finish|Search|Calculate|Verify)\s*\[",
+                text,
+            )
+            if action_match:
+                action_type, argument = parse_action(text[action_match.start():])
+                if action_type is not None:
+                    current_action = f"Action {self.step_n}: {action_type}[{argument}]"
+                    if not current_thought:
+                        current_thought = f"Thought {self.step_n}: I can proceed with the parsed action."
+
+        if observation_start is not None:
+            observation_end = observation_end if observation_end is not None else len(lines)
+            current_observation = "\n".join(lines[observation_start:observation_end])
+
+        if current_action and parse_action(current_action)[0] is None:
+            current_action = ""
+        if current_action and not current_thought:
+            current_thought = f"Thought {self.step_n}: I can proceed with the parsed action."
+        return current_thought, current_action, current_observation
+
+    def _record_parse_failure(self, sampled):
+        sampled = sampled or []
+        previews = [str(item or "")[:1000] for item in sampled[:3]]
+        direct_candidates = [
+            candidate for candidate in
+            [self._normalize_direct_answer_candidate(item) for item in sampled]
+            if candidate
+        ]
+        if direct_candidates:
+            self.direct_answer_candidate = Counter(direct_candidates).most_common(1)[0][0]
+        failure = {
+            "step_n": self.step_n,
+            "actual_step_n": self.actual_step_n,
+            "sampled_count": len(sampled),
+            "empty_content_count": sum(1 for item in sampled if not str(item or "").strip()),
+            "missing_thought_action_count": len(sampled),
+            "first_raw_output_preview": previews[0] if previews else "",
+            "raw_output_previews": previews,
+            "direct_answer_candidate": self.direct_answer_candidate,
+        }
+        self.parse_failures.append(failure)
+        return failure
+
     def route_question(self):
         prompt = QUESTION_ROUTER_PROMPT.format(
             question=self.question,
@@ -952,7 +1225,7 @@ class ReactAgent:
             headers=self.get_table_headers()
         )
         try:
-            output = self._call_plan_llm_once(prompt)
+            output = self._call_plan_llm_once(prompt, phase="router")
             profile = self._extract_json_object(output)
             self.question_profile = self._normalize_question_profile(profile)
         except Exception:
@@ -1039,7 +1312,7 @@ class ReactAgent:
             claim=claim
         )
         try:
-            output = self._call_plan_llm_once(prompt)
+            output = self._call_plan_llm_once(prompt, phase="verifier")
             parsed = self._extract_json_object(output)
             if isinstance(parsed, dict):
                 parsed.setdefault("valid", False)
@@ -1098,7 +1371,7 @@ class ReactAgent:
                     f"code in one python code block.\nTable dataframe: {table_df}\nErroneous code: {extracted_code}\n"
                     f"Error message: {current_error}\nRevised code:"
                 )
-                return self.prompt_agent_gpt_coder(prompt)[0]
+                return self.prompt_agent_gpt_coder(prompt, phase="code_repair")[0]
             return code_revise.run(
                 current_error=str(current_error),
                 extracted_code=extracted_code,
@@ -1125,16 +1398,31 @@ class ReactAgent:
                 valid_pre_answers = self._valid_pre_answers()
                 if valid_pre_answers:
                     self.answer = Counter(valid_pre_answers).most_common(1)[0][0]
+                    self.finished = True
+                    self.run_status = "fallback_answered"
+                elif self.direct_answer_candidate and self._can_use_direct_answer_candidate():
+                    self.answer = self.direct_answer_candidate
+                    self.fallback_answer = self.direct_answer_candidate
+                    self.finished = True
+                    self.run_status = "fallback_answered"
                 else:
                     self.answer = self._get_safe_quick_answer()
+                    self.finished = self.answer != "N/A"
+                    self.run_status = "fallback_answered" if self.finished else "fallback_na"
             else:
                 # direct prompting
                 self.answer = self._get_safe_quick_answer()
+                self.finished = self.answer != "N/A"
+                self.run_status = "fallback_answered" if self.finished else "fallback_na"
+        elif self.finished:
+            self.run_status = "finished"
+        elif self.is_halted() and self.run_status == "running":
+            self.run_status = "halted"
 
     def step(self) -> None:
         if self.direct_reasoning:
             if self.plan_backend == "openai":
-                llm_sampled = self.prompt_agent_gpt(mode="text")
+                llm_sampled = self.prompt_agent_gpt(mode="text", phase="direct_text")
             else:
                 llm_sampled = self.prompt_agent(mode="text")
             llm_sampled_ = [self.get_answer_from_llm(
@@ -1142,7 +1430,7 @@ class ReactAgent:
             prompt = self.code_prompt.format(
                 examples=self.code_examples, table=self.table_df, question=self.question, context=self.context)
             if self.code_backend == "openai":
-                code_sampled = self.prompt_agent_gpt_coder(prompt)
+                code_sampled = self.prompt_agent_gpt_coder(prompt, phase="direct_code")
             else:
                 code_sampled = [direct_code.run(prompt, backend=self.codeagent_endpoint)[
                     "result"] for i in range(self.code_sample)]
@@ -1157,12 +1445,20 @@ class ReactAgent:
 
         else:
             if self.plan_backend == "openai":
-                sampled = self.prompt_agent_gpt()
+                sampled = self.prompt_agent_gpt(phase="react_step")
             else:
                 sampled = self.prompt_agent(mode="both")
             self.actual_step_n += 1
             thought, action, observation, all_observations = self.as_reward_fn(
                 sampled)
+            if thought == "" or action == "":
+                self.empty_parse_streak += 1
+                self._record_parse_failure(sampled)
+                if self.empty_parse_streak >= 3:
+                    self.run_status = "halted"
+                    self.actual_step_n = self.max_actual_steps + 1
+            else:
+                self.empty_parse_streak = 0
             if (
                 self.use_pre_answer
                 and self.pre_ans
@@ -1283,15 +1579,35 @@ class ReactAgent:
                 print("==============current step===========")
                 print(self.scratchpad)
 
-    def prompt_agent_gpt(self, mode="both") -> str:
+    def prompt_agent_gpt(self, mode="both", phase="react_step") -> str:
         prompt = self._build_agent_prompt(mode=mode)
         preds = get_completion(
-            prompt, client=self.client, n=self.plan_sample, model=self.plan_model_name)
+            prompt,
+            client=self.client,
+            n=self.plan_sample,
+            model=self.plan_model_name,
+            phase=phase,
+            step_n=self.step_n,
+            debug_logger=self._log_llm_io,
+            debug_full_prompt=self.debug_full_prompt,
+            max_tokens=self.openai_max_tokens,
+            temperature=self.openai_temperature,
+        )
         return preds
 
-    def prompt_agent_gpt_coder(self, prompt) -> str:
+    def prompt_agent_gpt_coder(self, prompt, phase="code_generation") -> str:
         preds = get_completion(
-            prompt, client=self.client, n=self.code_sample, model=self.code_model_name)
+            prompt,
+            client=self.client,
+            n=self.code_sample,
+            model=self.code_model_name,
+            phase=phase,
+            step_n=self.step_n,
+            debug_logger=self._log_llm_io,
+            debug_full_prompt=self.debug_full_prompt,
+            max_tokens=self.openai_max_tokens,
+            temperature=self.openai_temperature,
+        )
         return preds
 
     def global_planning(self, given_plan) -> None:
@@ -1331,7 +1647,17 @@ class ReactAgent:
                 prompt, num_return_sequences=self.plan_sample, return_prob=False)
         else:
             answer = get_completion(
-                prompt, client=self.client, n=self.plan_sample, model=self.plan_model_name)
+                prompt,
+                client=self.client,
+                n=self.plan_sample,
+                model=self.plan_model_name,
+                phase="quick_answer",
+                step_n=self.step_n,
+                debug_logger=self._log_llm_io,
+                debug_full_prompt=self.debug_full_prompt,
+                max_tokens=self.openai_max_tokens,
+                temperature=self.openai_temperature,
+            )
         answers = [ans.split(":")[-1].strip() for ans in answer]
         answer = Counter(answers).most_common(1)[0][0]
         return answer
@@ -1352,7 +1678,17 @@ class ReactAgent:
             question=self.question)
         if self.plan_backend == "openai":
             return get_completion(
-                prompt, client=self.client, n=1, model=self.plan_model_name)
+                prompt,
+                client=self.client,
+                n=1,
+                model=self.plan_model_name,
+                phase="global_plan",
+                step_n=self.step_n,
+                debug_logger=self._log_llm_io,
+                debug_full_prompt=self.debug_full_prompt,
+                max_tokens=self.openai_max_tokens,
+                temperature=self.openai_temperature,
+            )
         return self.llm(prompt, num_return_sequences=1, return_prob=False)
 
     def _build_agent_prompt(self, mode="both") -> str:
@@ -1363,7 +1699,13 @@ class ReactAgent:
                 context=self.context,
                 question=self.question)
         elif mode == "both":
-            scratchpad = self._build_control_context() + self.scratchpad
+            format_instruction = (
+                f"Format requirement: your next response must contain only the current step, "
+                f"with exactly one line starting with Thought {self.step_n}: and exactly one "
+                f"line starting with Action {self.step_n}:. Do not include explanations, "
+                "markdown, or extra sections outside those two lines.\n"
+            )
+            scratchpad = self._build_control_context() + self.scratchpad + format_instruction
             return self.agent_prompt.format(
                 examples=self.react_examples,
                 table=self.table_string,
@@ -1406,12 +1748,24 @@ class ReactAgent:
             if not self._is_action_like_answer(answer)
         ]
 
+    def _can_use_direct_answer_candidate(self):
+        if not self.direct_answer_candidate:
+            return False
+        if not self.use_verifier:
+            return True
+        verification = self.verify_finish_answer(self.direct_answer_candidate)
+        self.direct_answer_candidate_verification = verification
+        return self._is_verification_valid(verification)
+
     def _get_safe_quick_answer(self):
         answer = self.get_quick_answer()
+        self.fallback_answer = answer
         if self._is_action_like_answer(answer):
+            self.fallback_rejected_reason = "empty_or_action_like"
             print("==============answer fallback warning===========")
             print(f"Rejected action-like quick answer: {answer}")
             return "N/A"
+        self.fallback_rejected_reason = ""
         return answer
 
     def _is_action_like_answer(self, answer):
@@ -1451,6 +1805,14 @@ class ReactAgent:
         self.finished = False
         self.scratchpad: str = ''
         self.pre_ans = None
+        self.pre_ans_all = []
+        self.parse_failures = []
+        self.empty_parse_streak = 0
+        self.direct_answer_candidate = ""
+        self.direct_answer_candidate_verification = None
+        self.fallback_answer = ""
+        self.fallback_rejected_reason = ""
+        self.run_status = "running"
         self.verification_cache = {}
 
     def set_qa(self, question: str, key: str) -> None:

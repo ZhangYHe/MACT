@@ -55,6 +55,7 @@ SUPPLEMENTAL_ARGS=(
   --use_router
   --use_verifier
   --use_code_repair
+  --debug_llm_io
 )
 
 EXTRA_ARGS=()
