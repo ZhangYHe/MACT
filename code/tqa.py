@@ -38,7 +38,7 @@ from openai import OpenAI
 from sglang.lang.chat_template import (ChatTemplate, get_chat_template,
                                        register_chat_template)
 from transformers import AutoTokenizer
-from utils import summarize_react_trial, table2df
+from utils import normalize_table_rows, summarize_react_trial, table2df
 from utils import get_databench_table
 from vllm import LLM
 
@@ -57,6 +57,8 @@ def write_to_file(path, agent, idx, new_table_dataset, given_plan):
         item["fallback_rejected_reason"] = agent.fallback_rejected_reason
         item["direct_answer_candidate"] = agent.direct_answer_candidate
         item["direct_answer_candidate_verification"] = agent.direct_answer_candidate_verification
+        item["table_diagnostics"] = agent.table_diagnostics
+        item["tool_events"] = agent.tool_events
         # item["code_log"] = agent.generated_code
         # item["plan_log"] = agent.generated_plan
         f.write(json.dumps(item)+"\n")
@@ -146,14 +148,18 @@ def main(args):
     agents = []
     for _, row in enumerate(table_dataset):
         row_task = resolve_row_task(row, args.task)
+        table_diagnostics = []
         if row_task == "databench":
             databench_table = get_databench_table(args.table_dir, row["dataset"])
             table = databench_table[0]
-            table_df = table2df(databench_table[1])
+            normalized_table = normalize_table_rows(
+                databench_table[1], diagnostics=table_diagnostics)
+            table_df = table2df(normalized_table)
             df_path = databench_table[2]
         else:
-            table = row["table_text"]
-            table_df = table2df(row["table_text"])
+            table = normalize_table_rows(
+                row["table_text"], diagnostics=table_diagnostics)
+            table_df = table2df(table)
             df_path = None
 
         agents.append(agent_cls(
@@ -197,6 +203,8 @@ def main(args):
             debug_llm_io=args.debug_llm_io,
             debug_full_prompt=args.debug_full_prompt,
             debug_log_path=args.debug_log_path,
+            table_diagnostics=table_diagnostics,
+            postprocess_pred_answer=args.postprocess_pred_answer,
             openai_max_tokens=args.openai_max_tokens,
             openai_temperature=args.openai_temperature,
         ))
@@ -305,6 +313,8 @@ if __name__ == '__main__':
                         help="revise generated calculation code once when execution fails.")
     parser.add_argument('--use_repair', action='store_true',
                         help="deprecated alias for --use_code_repair.")
+    parser.add_argument('--postprocess_pred_answer', action='store_true',
+                        help="enable conservative final-answer postprocessing for evaluator-friendly formatting.")
     parser.add_argument('--disable_search', action='store_true',
                         help="disable Search actions for ablation.")
     parser.add_argument('--disable_calculate', action='store_true',

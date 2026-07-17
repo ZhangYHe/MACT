@@ -75,10 +75,44 @@ def table_linear(table, num_row):
     return output
 
 
-def table2df(table):
-    # transform table in list format into df code
-    # currently only relational table
+def normalize_table_rows(table, diagnostics=None):
+    """Normalize relational rows to the header width and report repairs."""
+    diagnostics = diagnostics if diagnostics is not None else []
+    if not table:
+        return table
+
+    header = list(table[0])
+    expected_width = len(header)
+    normalized = [header]
+    for row_index, row in enumerate(table[1:], start=1):
+        row = list(row)
+        actual_width = len(row)
+        if actual_width < expected_width:
+            row.extend([""] * (expected_width - actual_width))
+            diagnostics.append({
+                "source_row_index": row_index,
+                "actual_width": actual_width,
+                "expected_width": expected_width,
+                "action": "padded_right",
+            })
+        elif actual_width > expected_width:
+            row = row[:expected_width]
+            diagnostics.append({
+                "source_row_index": row_index,
+                "actual_width": actual_width,
+                "expected_width": expected_width,
+                "action": "truncated_right",
+            })
+        normalized.append(row)
+    return normalized
+
+
+def table2df(table, diagnostics=None):
+    # transform table in list format into executable dataframe code
+    table = normalize_table_rows(table, diagnostics=diagnostics)
     output = "import pandas as pd\n"
+    if not table:
+        return output + "df=pd.DataFrame()"
     header = table[0]
     header = [clean_cell(cell, i, header=True)
               for i, cell in enumerate(header)]
@@ -102,18 +136,9 @@ def table2df(table):
             row_.append(cell)
         rows_.append(row_)
 
-    transposed_rows = [[] for i in range(len(header))]
-    for line in rows_:
-        for i, cell in enumerate(line):
-            transposed_rows[i].append(cell)
-    output += "data={"
-    for h, v_row in zip(header, transposed_rows):
-        output += f"'{h}':{v_row}"
-        output += ","
-    output = output[:-1]
-    output += "}"
-    output += "\n"
-    output += "df=pd.DataFrame(data)"
+    output += f"data_rows={rows_!r}\n"
+    output += f"data_columns={header!r}\n"
+    output += "df=pd.DataFrame(data_rows, columns=data_columns)"
     return output
 
 

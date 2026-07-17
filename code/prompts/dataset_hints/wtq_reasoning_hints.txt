@@ -1,9 +1,16 @@
 Dataset-specific hints for WikiTableQuestions (WTQ):
 - WTQ is evaluated by denotation. Finish with the exact table value(s) that answer the question, not an explanation.
 - If the answer has multiple values, prefer the WTQ TSV-style separator |, for example Finish[A | B]. A Python-style list such as Finish[["A", "B"]] is also acceptable, but | is simpler and less error-prone.
+- Use | only when the question asks for multiple answer values, such as list, all, each, names, or which ones. If the answer is one combined item made from multiple fields, return one string in table-evidence order rather than splitting it with |.
 - Do not join multiple answer values with semicolons, commas, or a natural-language phrase such as "A and B" unless that whole phrase is a single table cell.
 - Prefer the surface values shown in the table. Do not add parenthetical country codes, units, or extra context unless they are part of the required table value.
 - Unless the question explicitly asks for distinct or unique values, count or select from table rows/cells as they appear.
+- For average, ratio, and percentage questions, if the question does not specify precision and the gold-style answer is likely a rounded value, finish with a concise rounded answer, usually two decimal places. Do not expose long floating-point artifacts.
+- For win-loss records, scores, and other hyphenated numeric records, preserve the compact table-style form such as 1-7, not 1 - 7.
+- For compare/how do X compare questions, finish with the requested relationship or compact conclusion such as larger, smaller, same, higher, or lower. Do not finish with a long evidence list unless the question asks to list evidence.
+- When comparing a measure over plural groups, determine and execute the intended group aggregation before comparing. For example, compare the total gross of movies by summing all qualifying movies, not by comparing only each group's maximum row.
+- For categorical availability/support columns, do not treat every value other than No as affirmative. Unless historical or experimental availability is requested, values such as Beta, Test release, and Discontinued are not equivalent to Yes.
+- For questions asking what every value begins or starts with, retrieve the complete target column and compute the shared leading character/prefix instead of inventing a row entity.
 - For superlatives such as first, last, before, after, least, and most, follow the table order and the wording of the question before applying outside assumptions.
 - If a singular question asks for one item (for example "which country" or "what name") and multiple table values tie for least/most/first/last, return the first tied value in table order unless the question asks for all, each, list, or names.
 - For "last" questions, do not exclude DNF, DNS, N/A, blank, or non-numeric rows unless the question explicitly says numeric result, valid finisher, completed, or finished with a time/rank.

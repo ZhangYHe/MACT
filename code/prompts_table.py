@@ -61,7 +61,7 @@ Code:
 """
 
 
-QUESTION_ROUTER_PROMPT = """You are an expert in table question answering. Classify the question using only the question, context, and table headers.
+QUESTION_ROUTER_PROMPT = """You are an expert in table question answering. Classify the question using the question, context, table headers, and representative column values.
 
 Choose exactly one question_type from:
 lookup, filter, comparison, aggregation, arithmetic, multi_hop.
@@ -70,23 +70,47 @@ Return only a JSON object with these keys:
 {{
   "question_type": "...",
   "target_columns": ["..."],
+  "candidate_columns": ["..."],
   "constraints": ["..."],
   "required_operations": ["..."],
+  "aggregation_operator": "none",
+  "membership_predicate": "",
+  "answer_shape": "scalar",
+  "composite_columns": [],
   "allowed_tools": ["Retrieve", "Calculate", "Search", "Finish"],
+  "ambiguous": false,
+  "ambiguity_reason": "",
+  "requires_evidence": false,
   "reasoning_pattern": "..."
 }}
 
 Use "Search" only when external entity knowledge may be needed. Include "Verify" in allowed_tools only when verification may be useful for ambiguous, multi-step, or calculation-heavy questions.
+Treat literal header matches as primary evidence: include them in target_columns or candidate_columns, and do not replace a matched header with a semantically related column without first retrieving both. Use representative values to distinguish column-level patterns, row lookups, and outside-world interpretations. Set ambiguous and requires_evidence to true when multiple columns are plausible, and require retrieval of the competing columns before calculation.
+Choose aggregation_operator from none, count, sum, average, min, max, ratio, common_prefix, compare. State the exact membership predicate for filtered sets; do not treat every value other than "No" as affirmative. Choose answer_shape from scalar, multi_value, composite. A composite is one answer made from multiple columns; list those columns in original table-header order.
 
 Question: {question}
 Context: {context}
 Table headers: {headers}
+Literal header matches in the question: {literal_header_matches}
+Representative column values: {column_samples}
 """
 
 
 VERIFY_PROMPT = """You are verifying a table question answering reasoning step or final answer.
 
-Judge whether the claim directly answers the question and is supported by the table, context, or reasoning history. Check whether the claim is non-empty, satisfies the question constraints, uses the required operation when relevant, and is supported by the available evidence.
+Judge whether the claim directly answers the question and is supported by the table, context, and successful tool evidence. Check whether the claim is non-empty, uses the intended target column, satisfies every constraint, performs the required operation, and has the expected final-answer shape. A claim merely appearing somewhere in the table or reasoning history is not sufficient. Reject mathematically correct calculations that use the wrong column.
+
+Final-answer shape checks:
+- If the question asks for a compact comparison, the final claim should be the relationship or conclusion, not a long evidence list.
+- If the answer is one combined item made from multiple fields, it should remain one answer item; do not split it as multiple answers.
+- If the question asks for average, ratio, or percentage and does not specify precision, prefer a concise rounded answer, usually two decimal places, over a long floating-point artifact.
+- Preserve compact table-style numeric records such as 1-7 rather than adding spaces around the hyphen.
+
+SciTab label policy:
+- The final answer must be exactly one of supports, refutes, or not enough info.
+- Use refutes only when the table or caption directly contradicts a required value, trend, entity, condition, or comparison.
+- Missing exact metrics, missing precision/recall when only F-score is shown, missing statistical significance, missing causal mechanism, unclear experiment-setting mapping, or insufficient table-number/context evidence should usually be not enough info rather than refutes.
+- If successful retrieved evidence clearly identifies a relevant table section or column that differs from the router profile, evaluate the claim against the retrieved evidence instead of rejecting solely because of the initial router profile.
 
 Return only a JSON object with these keys:
 {{
@@ -103,20 +127,78 @@ Question: {question}
 Context: {context}
 Table:
 {table}
+Question routing profile:
+{question_profile}
+Tool execution records:
+{tool_events}
 Reasoning history:
 {scratchpad}
 Claim to verify: {claim}
 """
 
 
+SCITAB_VERIFY_PROMPT = """You are independently classifying the relationship between a scientific claim and one table plus its caption.
+
+Do not evaluate or defend a previously proposed label. Determine the evidence relation from scratch.
+
+Return only this JSON object:
+{{
+  "evidence_relation": "supports",
+  "alignment": {{
+    "entity": true,
+    "metric": true,
+    "condition": true,
+    "unit": true,
+    "semantic_role": true
+  }},
+  "reason": "...",
+  "suggested_next_action": "..."
+}}
+
+evidence_relation must be exactly supports, refutes, or not enough info.
+
+Decision policy:
+- supports: the aligned table/caption evidence entails the claim.
+- refutes: entity, metric, condition, unit, and semantic role all align, and the evidence directly shows an opposite value, direction, entity, or comparison.
+- not enough info: any required field is absent or misaligned, or the evidence neither entails nor directly contradicts the claim.
+- A missing metric is not a contradiction. Precision cannot be inferred from F-score; recall cannot be inferred from F-score; statistical significance cannot be inferred from unmarked numeric differences.
+- A different table number means the supplied evidence may not be the table referenced by the claim, so use not enough info rather than refutes.
+- Do not use an output representation column to contradict a claim about model inputs, or vice versa. Treat different semantic roles as not enough info.
+- A claim about low-degree nodes is aligned with a table section that explicitly buckets Max Node Out-degree or node degree. Compare the low-degree bucket before deciding; do not mark it not enough info merely because the wording is not identical.
+- For a multi-metric "A outperforms B" claim, A supports the claim when it is no worse on every corresponding metric and strictly better on at least one; ties do not require not enough info.
+
+Original scientific claim:
+{original_claim}
+Table caption/context:
+{context}
+Table:
+{table}
+Question routing profile:
+{question_profile}
+Successful and failed tool execution records:
+{tool_events}
+Reasoning history:
+{scratchpad}
+"""
+
+
 ROUTED_CONTEXT_TEMPLATE = """Question routing profile:
 - question_type: {question_type}
 - target_columns: {target_columns}
+- candidate_columns: {candidate_columns}
+- literal_header_matches: {literal_header_matches}
 - constraints: {constraints}
 - required_operations: {required_operations}
+- aggregation_operator: {aggregation_operator}
+- membership_predicate: {membership_predicate}
+- answer_shape: {answer_shape}
+- composite_columns: {composite_columns}
 - allowed_tools: {allowed_tools}
+- ambiguous: {ambiguous}
+- ambiguity_reason: {ambiguity_reason}
+- requires_evidence: {requires_evidence}
 - reasoning_pattern: {reasoning_pattern}
-Use this profile to choose actions, but keep following the original task format.
+Use this profile to choose actions, but keep following the original task format. When requires_evidence is true, retrieve the literal header matches and competing candidate columns before calculating or finishing.
 """
 
 

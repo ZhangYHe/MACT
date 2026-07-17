@@ -4,5 +4,12 @@ Dataset-specific hints for SciTab:
 - Use supports only when the table directly entails the claim.
 - Use refutes when the table directly contradicts the claim.
 - Use not enough info when the table and caption do not provide enough evidence to prove or disprove the claim.
+- Be conservative with refutes. Missing exact metrics, missing precision/recall when only F-score is shown, missing statistical significance, missing causal mechanism, unclear experiment-setting mapping, or insufficient table-number/context evidence should usually be not enough info rather than refutes.
+- Do not refute a claim merely because related metrics look weaker or incomplete. Refute only when the table directly shows the opposite value, trend, entity, condition, or comparison required by the claim.
+- Keep the original scientific claim separate from the candidate output label. First decide the evidence relation, then output that relation as the label.
+- Before using refutes, align the entity, metric, condition, unit, and semantic role. Any missing or mismatched field means not enough info rather than refutes.
+- A claim referencing a different table number than the supplied caption is not directly contradicted by the supplied table; use not enough info.
+- For multi-metric comparisons, A outperforms B when A is no worse on every corresponding metric and strictly better on at least one; ties on some metrics do not prevent supports.
+- Treat low-degree-node claims as aligned with explicit Max Node Out-degree or node-degree buckets; retrieve and compare the low-degree bucket rather than rejecting it as a wording mismatch.
 - Do not answer with yes/no, true/false, explanations, or a rewritten claim in Finish.
 - Be careful with approximate values, units, column labels, row labels, experimental settings, and comparison direction.

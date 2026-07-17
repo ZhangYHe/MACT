@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -42,6 +43,75 @@ def answer_to_items(answer: object) -> list[object]:
     return prediction_to_items(answer)
 
 
+def compact_answer_text(value: object) -> str:
+    text = str(value).strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"(?<=\d)\s+-\s+(?=\d)", "-", text)
+    if text.endswith("."):
+        text = text[:-1]
+    return text
+
+
+def is_rounding_format_mismatch(gold_items: list[object], prediction_items: list[object]) -> bool:
+    if len(gold_items) != 1 or len(prediction_items) != 1:
+        return False
+    gold_text = str(gold_items[0]).strip()
+    prediction_text = str(prediction_items[0]).strip()
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", gold_text):
+        return False
+    if not re.fullmatch(r"-?\d+\.\d{3,}", prediction_text):
+        return False
+    try:
+        return f"{float(prediction_text):.2f}" == f"{float(gold_text):.2f}"
+    except ValueError:
+        return False
+
+
+def classify_error(item: dict, detail: dict, gold_items: list[object], prediction_items: list[object]) -> str:
+    if detail["correct"]:
+        return ""
+    if detail["error"]:
+        return "invalid_example"
+
+    task = detail["task"]
+    prediction = detail["pred_answer"]
+    question = str(item.get("question") or item.get("statement") or "").lower()
+    gold_texts = [str(value) for value in gold_items]
+
+    if task == "scitab":
+        labels = {"supports", "refutes", "not enough info"}
+        if compact_answer_text(prediction) in labels and {
+            compact_answer_text(value) for value in gold_texts
+        }.issubset(labels):
+            return "label_boundary"
+
+    if len(gold_items) == len(prediction_items) == 1:
+        if compact_answer_text(gold_items[0]) == compact_answer_text(prediction_items[0]):
+            return "format_mismatch"
+    if is_rounding_format_mismatch(gold_items, prediction_items):
+        return "format_mismatch"
+
+    if "|" in str(prediction) and len(prediction_items) != len(gold_items):
+        return "answer_shape_error"
+    if (
+        len(gold_items) == 1
+        and any(marker in str(prediction) for marker in [":", ";", "—", " - "])
+        and any(term in question for term in ["compare", "how do", "larger", "smaller", "higher", "lower"])
+    ):
+        return "answer_shape_error"
+
+    tool_events = item.get("tool_events") or []
+    if any(event.get("status") == "empty_result" for event in tool_events):
+        return "router_semantic_error"
+    if any(
+        term in question
+        for term in [" client", " champion", " nickname", " supply ", " supplies ", " supplied "]
+    ):
+        return "router_semantic_error"
+
+    return "semantic_error"
+
+
 def evaluate_item(item: dict, task: str) -> dict:
     example_id = item["id"]
     prediction = prediction_to_string(item.get("pred_answer"))
@@ -58,7 +128,7 @@ def evaluate_item(item: dict, task: str) -> dict:
 
     correct = False if error else check_denotation(target_values, predicted_values)
 
-    return {
+    detail = {
         "id": example_id,
         "task": task,
         "metric": TASK_METRICS[task],
@@ -71,6 +141,9 @@ def evaluate_item(item: dict, task: str) -> dict:
         "target_values": [repr(value) for value in target_values],
         "predicted_values": [repr(value) for value in predicted_values],
     }
+    detail["error_category"] = classify_error(
+        item, detail, gold_items, prediction_items)
+    return detail
 
 
 def summarize(details: list[dict], total_results: int) -> dict:
@@ -108,6 +181,11 @@ def summarize(details: list[dict], total_results: int) -> dict:
         total_invalid += invalid
 
     overall_accuracy = total_correct / total_evaluated if total_evaluated else 0.0
+    error_categories = Counter(
+        detail["error_category"]
+        for detail in details
+        if not detail["correct"] and detail.get("error_category")
+    )
     return {
         "metric": "mixed_denotation_accuracy",
         "total_results": total_results,
@@ -117,6 +195,7 @@ def summarize(details: list[dict], total_results: int) -> dict:
         "empty_prediction_count": total_empty_predictions,
         "invalid_gold_count": total_invalid,
         "task_counts": dict(Counter(detail["task"] for detail in details)),
+        "error_categories": dict(error_categories),
         "by_task": task_metrics,
     }
 
@@ -137,6 +216,10 @@ def write_metrics_text(path: Path, metrics: dict) -> None:
                 f"accuracy={task_metrics['accuracy']} "
                 f"metric={task_metrics['metric']}\n"
             )
+        if metrics.get("error_categories"):
+            output_file.write("\nError categories:\n")
+            for category, count in sorted(metrics["error_categories"].items()):
+                output_file.write(f"- {category}: {count}\n")
 
 
 def write_summary_markdown(path: Path, metrics: dict, result_jsonl: Path) -> None:

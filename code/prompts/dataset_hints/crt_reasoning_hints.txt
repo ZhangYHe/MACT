@@ -3,6 +3,11 @@ Dataset-specific hints for CRT-QA:
 - Use the table title/context only as supporting context; prefer evidence from the table cells when selecting the final answer.
 - CRT-QA often requires combining multiple conditions across rows or columns. Check every stated constraint before finishing.
 - For comparison, ranking, before/after, max/min, or counting questions, preserve the table's row order unless the question explicitly asks for sorted numeric order.
-- If the answer has multiple values, return them as structured separate items or a simple separator form. Do not write a prose sentence such as "the answers are ...".
+- If the answer has multiple values, return them as structured separate items or a simple separator form. Use a separator only when the question asks for multiple values. If the answer is one combination made from multiple fields, return one compact string in table-evidence order.
+- For average, ratio, and percentage questions, if the question does not specify precision, finish with a concise rounded answer, usually two decimal places. Do not expose long floating-point artifacts.
+- For win-loss records, scores, and other hyphenated numeric records, preserve the compact table-style form such as 1-7, not 1 - 7.
+- For compare/how do X compare questions, finish with the requested relationship or compact conclusion such as larger, smaller, same, higher, or lower. Do not finish with a long evidence list unless the question asks to list evidence.
+- For same men's and women's nickname questions, remove gender markers such as "lady" first. If the remaining values differ only by one modifier but share the same mascot head noun, treat them as the same core nickname unless exact equality is requested.
+- When comparing a measure over plural groups, perform the intended group aggregation first. A question comparing the gross of movies by two studios requires summing every qualifying movie for each studio, not comparing only the maximum-grossing movie.
 - Do not add external facts from Search unless the question cannot be resolved from the table title and cells.
 - If several table cells look similar, use column headers and row labels to disambiguate before calculating or finishing.

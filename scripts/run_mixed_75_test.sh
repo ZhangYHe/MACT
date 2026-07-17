@@ -45,8 +45,7 @@ EOF
 WORKERS="${WORKERS:-6}"
 RUN_LIMIT="${RUN_LIMIT:-6}"
 DATASET_PATH="${PROJECT_ROOT}/output/mixed_data_75/mixed_75.jsonl"
-MODEL_CONFIG="${PROJECT_ROOT}/config/gpt-5.json"
-RUN_DIR="${PROJECT_ROOT}/output/runs/mixed_6_gpt-5_$(date +%Y%m%d_%H%M)"
+RUN_DIR="${PROJECT_ROOT}/output/runs/mixed_6_gpt-5.4_$(date +%Y%m%d_%H%M)"
 
 PLAN_SAMPLE=1
 CODE_SAMPLE=1
