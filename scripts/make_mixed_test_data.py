@@ -127,7 +127,7 @@ def main() -> None:
         {
             "task": "crt",
             "dataset_path": Path(args.crt_dataset_path).expanduser().resolve(),
-            "split": "dataset",
+            "split": "answerable",
             "exclude_ids_paths": [],
         },
         {

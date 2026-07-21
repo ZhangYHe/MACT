@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
             "Dataset split to convert. For WTQ, supported aliases include train, "
             "test, dev, validation, pristine-unseen-tables, pristine-seen-tables, "
             "training-before300, and random-split-{1..5}-{train,dev}. "
-            "For CRT-QA, supported splits are dataset, unanswerable, and all. "
+            "For CRT-QA, supported splits are all, answerable, and unanswerable. "
             "For TAT-QA, supported splits are train, dev, validation, test, "
             "test_gold, and test-gold. For SciTab, supported split is all."
         ),
@@ -194,7 +194,8 @@ def load_wtq_examples(
                     "answer": split_wtq_answer(row["targetValue"]),
                     "_metadata": {
                         "id": row["id"],
-                        "dataset": "WikiTQ",
+                        "dataset": "wtq",
+                        "task": "wtq",
                         "split": split,
                         "table_id": table_id,
                     },
@@ -207,13 +208,17 @@ def load_wtq_examples(
 
 
 def resolve_crt_data_file(dataset_path: Path, split: str) -> Path:
-    if split not in {"dataset", "unanswerable"}:
+    split_files = {
+        "answerable": "dataset.json",
+        "unanswerable": "unanswerable.json",
+    }
+    if split not in split_files:
         raise ValueError(
             f"Invalid CRT-QA data split '{split}'. Supported data files: "
-            "dataset, unanswerable"
+            "answerable, unanswerable"
         )
 
-    data_file = dataset_path / f"{split}.json"
+    data_file = dataset_path / split_files[split]
     if not data_file.is_file():
         raise FileNotFoundError(f"CRT-QA data file does not exist: {data_file}")
     return data_file
@@ -257,7 +262,7 @@ def load_crt_answerable_examples(
     table_cache: dict[str, list[list[str]]],
     stop_after: int | None = None,
 ) -> list[dict]:
-    data_file = resolve_crt_data_file(dataset_path, "dataset")
+    data_file = resolve_crt_data_file(dataset_path, "answerable")
     with data_file.open("r", encoding="utf-8") as input_file:
         data = json.load(input_file)
 
@@ -275,10 +280,11 @@ def load_crt_answerable_examples(
                     "table_text": table_cache[table_id],
                     "answer": normalize_crt_answer(row.get("Answer")),
                     "_metadata": {
-                        "id": f"crt:dataset:{table_id}:{question_index}",
-                        "dataset": "CRT-QA",
+                        "id": f"crt:answerable:{table_id}:{question_index}",
+                        "dataset": "crt",
+                        "task": "crt",
                         "split": requested_split,
-                        "source_split": "dataset",
+                        "source_split": "answerable",
                         "table_id": table_id,
                         "title": row.get("Tittle") or row.get("Title"),
                         "directness": row.get("Directness"),
@@ -317,7 +323,8 @@ def load_crt_unanswerable_examples(
                 "answer": [],
                 "_metadata": {
                     "id": f"crt:unanswerable:{table_id}:{question_index}",
-                    "dataset": "CRT-QA",
+                    "dataset": "crt",
+                    "task": "crt",
                     "split": requested_split,
                     "source_split": "unanswerable",
                     "table_id": table_id,
@@ -341,14 +348,14 @@ def load_crt_examples(
     if stop_after is not None and stop_after < 0:
         raise ValueError(f"--limit must be non-negative, got {stop_after}")
 
-    if split not in {"dataset", "unanswerable", "all"}:
+    if split not in {"all", "answerable", "unanswerable"}:
         raise ValueError(
             "Invalid CRT-QA split "
-            f"'{split}'. Supported splits: all, dataset, unanswerable"
+            f"'{split}'. Supported splits: all, answerable, unanswerable"
         )
 
     table_cache: dict[str, list[list[str]]] = {}
-    if split == "dataset":
+    if split == "answerable":
         return load_crt_answerable_examples(
             dataset_path=dataset_path,
             requested_split=split,
@@ -488,7 +495,8 @@ def load_tat_examples(
                     "_metadata": {
                         "id": question_uid
                         or f"tat:{split}:{table_id}:{question.get('order', len(examples))}",
-                        "dataset": "TAT-QA",
+                        "dataset": "tat",
+                        "task": "tat",
                         "split": split,
                         "table_id": table_id,
                         "question_order": question.get("order"),
@@ -568,7 +576,8 @@ def load_scitab_examples(
                 },
                 "_metadata": {
                     "id": row.get("id", f"scitab:{row_index}"),
-                    "dataset": "SciTab",
+                    "dataset": "scitab",
+                    "task": "scitab",
                     "split": "all",
                     "table_id": row.get("table_id"),
                     "paper": row.get("paper"),

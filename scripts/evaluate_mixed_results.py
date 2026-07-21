@@ -126,7 +126,7 @@ def evaluate_item(item: dict, task: str) -> dict:
     elif not gold_items:
         error = "empty_gold"
 
-    correct = False if error else check_denotation(target_values, predicted_values)
+    correct = None if error else check_denotation(target_values, predicted_values)
 
     detail = {
         "id": example_id,
@@ -159,16 +159,17 @@ def summarize(details: list[dict], total_results: int) -> dict:
 
     for task in sorted(TASK_METRICS):
         task_details = by_task.get(task, [])
-        evaluated = len(task_details)
-        correct = sum(1 for detail in task_details if detail["correct"])
+        valid_details = [detail for detail in task_details if not detail["error"]]
+        evaluated = len(valid_details)
+        correct = sum(1 for detail in valid_details if detail["correct"])
         empty_predictions = sum(
             1 for detail in task_details if detail["pred_answer"].strip() == ""
         )
-        invalid = sum(1 for detail in task_details if detail["error"])
+        invalid = len(task_details) - evaluated
         accuracy = correct / evaluated if evaluated else 0.0
         task_metrics[task] = {
             "metric": TASK_METRICS[task],
-            "total_results": evaluated,
+            "total_results": len(task_details),
             "evaluated": evaluated,
             "correct": correct,
             "accuracy": round(accuracy, 4),
