@@ -3,4 +3,5 @@ __pycache__/
 *.py[cod]
 output/
 
-tests/
+tests/*
+!tests/test_evaluate_crt_by_type.py
