@@ -89,6 +89,12 @@ class ReplayDiagnosticsTest(unittest.TestCase):
             replay["verifier"]["fallback_overrode_last_correct_finish"], 1)
         self.assertEqual(
             replay["direct_after_two_verifier_failures"]["correct"], 1)
+        self.assertEqual(
+            replay["deterministic_raw_preserve_finish_policy"]["correct"], 1)
+        self.assertEqual(
+            replay["deterministic_raw_preserve_finish_policy"]["right_to_wrong"], 0)
+        self.assertEqual(replay["paired_baseline"]["right_to_wrong"], 1)
+        self.assertEqual(replay["paired_baseline"]["net_correct_gain"], -1)
 
 
 class AnnotationLoadingTest(unittest.TestCase):

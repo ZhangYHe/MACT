@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
 
+import ast
 import json
 import os
 import re
@@ -43,6 +44,12 @@ from fewshots_table import (DEMO_CRT, DEMO_CRT_DIRECT, DEMO_SCITAB,
                             NUMERICAL_OPERATION_EXAMPLE_LONG_TABLE, GLOBAL_PLAN_EXAMPLES,
                             NUMERICAL_OPERATION_EXAMPLE_LONG_TABLE_GLOBAL)
 from llm import OpenSourceLLM
+from crt_patches import (
+    apply_contract_overrides,
+    match_crt_patches,
+    patch_ids,
+    patch_prompt_hints,
+)
 from prompts_table import (DIRECT_AGENT, NUMERICAL_OPERATION_PROMPT,
                            TABLE_OPERATION_PROMPT, react_agent_prompt_crt,
                            react_agent_prompt_scitab, react_agent_prompt_tat,
@@ -345,7 +352,7 @@ class ReactAgent:
         self.use_verifier = use_verifier
         self.use_code_repair = use_code_repair or use_repair
         self.use_repair = self.use_code_repair
-        self.disable_search = disable_search
+        self.disable_search = disable_search or task == "crt"
         self.disable_calculate = disable_calculate
         self.disable_coding_agent = disable_coding_agent
         self.log_router = log_router
@@ -358,6 +365,8 @@ class ReactAgent:
         self.openai_max_tokens = openai_max_tokens
         self.openai_temperature = openai_temperature
         self.question_profile = None
+        self.applied_crt_patches = []
+        self.applied_patch_ids = []
         self.verification_cache = {}
         if self.plan_backend == "local":
             self.llm = OpenSourceLLM(
@@ -462,6 +471,35 @@ class ReactAgent:
             raise ValueError("No Python code block was returned by the coding model.")
         return match.group(1).strip()
 
+    def _retry_crt_missing_python_block(
+        self, code_output, task_prompt, phase, output_variable="final_result"
+    ):
+        """Retry a malformed CRT code response once with a strict wrapper."""
+        try:
+            self._extract_python_block(code_output)
+            return code_output, False
+        except ValueError as exc:
+            if self.task != "crt" or "No Python code block" not in str(exc):
+                return code_output, False
+        retry_prompt = (
+            "Your previous response did not contain executable Python. Return exactly "
+            "one ```python``` code block and no prose. The code must use the provided "
+            "dataframe variables and assign the requested output to "
+            f"{output_variable}.\n\n"
+            f"Original task:\n{task_prompt}"
+        )
+        try:
+            if self.code_backend == "openai":
+                retried = self.prompt_agent_gpt_coder(
+                    retry_prompt, phase=phase)[0]
+            else:
+                retried = self.llm(
+                    retry_prompt, num_return_sequences=1, return_prob=False)[0]
+            self._extract_python_block(retried)
+            return retried, True
+        except Exception:
+            return code_output, True
+
     def _record_tool_event(
         self,
         tool,
@@ -473,6 +511,8 @@ class ReactAgent:
         result_preview="",
         result_row_count=None,
         input_row_count=None,
+        data_scope="",
+        result_artifact=None,
     ):
         event = {
             "step_n": self.step_n,
@@ -486,10 +526,112 @@ class ReactAgent:
             "result_preview": str(result_preview or "")[:1000],
             "result_row_count": result_row_count,
             "input_row_count": input_row_count,
+            "data_scope": data_scope,
+            "result_artifact": result_artifact or {},
         }
         self.tool_events.append(event)
         self._log_llm_io({"phase": "tool_execution", **event})
         return event
+
+    def _crt_dataframe_scope_code(self, recent_table_df):
+        """Expose both retrieved and full-table scopes to CRT calculation code."""
+        if self.task != "crt":
+            return recent_table_df
+        recent_code = (
+            recent_table_df
+            if isinstance(recent_table_df, str)
+            else self.table_df
+        )
+        full_code = self.table_df
+        if not isinstance(recent_code, str) or not isinstance(full_code, str):
+            return recent_table_df
+        return "\n".join([
+            recent_code,
+            "retrieved_df = df.copy()",
+            full_code,
+            "full_table_df = df.copy()",
+            "df = retrieved_df",
+        ])
+
+    def _infer_crt_data_scope(self, instruction, generated_code=""):
+        if self.task != "crt":
+            return ""
+        code = str(generated_code or "")
+        words = set(self._normalized_words(instruction).split())
+        if "full_table_df" in code:
+            return "full_table"
+        if words.intersection({"all", "overall", "entire", "full", "denominator"}):
+            return "full_table_requested"
+        return "retrieved_table"
+
+    def _crt_validation_row_count(self, recent_row_count, generated_code=""):
+        if self.task == "crt" and "full_table_df" in str(generated_code or ""):
+            full_row_count = self._table_state_row_count(self.table_df)
+            if full_row_count is not None:
+                return full_row_count
+        return recent_row_count
+
+    def _crt_validation_table(self, recent_table_df, generated_code=""):
+        if self.task == "crt" and "full_table_df" in str(generated_code or ""):
+            return self.table_df
+        return recent_table_df
+
+    def _build_crt_result_artifact(
+        self, instruction, result, input_row_count=None, generated_code=""
+    ):
+        if self.task != "crt":
+            return {}
+        text = str(result or "").strip()
+        artifact = {
+            "value": text[:1000],
+            "input_row_count": input_row_count,
+            "full_table_row_count": self._table_state_row_count(self.table_df),
+            "data_scope": self._infer_crt_data_scope(instruction, generated_code),
+            "rendering_candidates": [],
+        }
+        ratio_match = re.fullmatch(
+            r"(-?\d+(?:\.\d+)?)\s*([:/])\s*(-?\d+(?:\.\d+)?)", text
+        )
+        percent_match = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*%\.?", text)
+        number_match = re.fullmatch(r"-?\d+(?:\.\d+)?", text)
+        if ratio_match:
+            numerator = float(ratio_match.group(1))
+            denominator = float(ratio_match.group(3))
+            artifact.update({
+                "numerator": numerator,
+                "denominator": denominator,
+                "pair_delimiter": ratio_match.group(2),
+                "unsimplified_pair": text,
+            })
+            artifact["rendering_candidates"].append(text)
+            if denominator:
+                quotient = numerator / denominator
+                artifact["quotient"] = quotient
+                artifact["rendering_candidates"].extend([
+                    str(quotient),
+                    f"{quotient * 100:.1f}%",
+                ])
+        elif percent_match:
+            percentage = float(percent_match.group(1))
+            artifact["percentage"] = percentage
+            artifact["quotient"] = percentage / 100
+            artifact["rendering_candidates"].extend([
+                text.rstrip("."),
+                str(percentage / 100),
+            ])
+        elif number_match:
+            number = float(text)
+            artifact["number"] = number
+            artifact["rendering_candidates"].extend([
+                text,
+                f"{number:.1f}".rstrip("0").rstrip("."),
+                f"{number:.2f}".rstrip("0").rstrip("."),
+                f"{number:.3f}".rstrip("0").rstrip("."),
+            ])
+        artifact["rendering_candidates"] = list(dict.fromkeys(
+            artifact["rendering_candidates"]
+        ))
+        return artifact
 
     def _set_last_tool_error(self, tool, error=None, error_stage="", message=""):
         if error is not None:
@@ -776,6 +918,10 @@ class ReactAgent:
         results = []
         results2dfs = defaultdict(list)
         errors = []
+        retry_task_prompt = (
+            f"Instruction: {instruction}\nDataframe code:\n{self.table_df}\n"
+            "Assign the filtered dataframe to new_table."
+        )
         if self.code_model_name == self.plan_model_name:
             # use one base model
             prompt = TABLE_OPERATION_PROMPT.format(
@@ -788,6 +934,9 @@ class ReactAgent:
                 codes = self.prompt_agent_gpt_coder(prompt)
 
             for code_strings in codes:
+                code_strings, _ = self._retry_crt_missing_python_block(
+                    code_strings, retry_task_prompt, "retrieve_code_retry",
+                    output_variable="new_table")
                 rows, error, executable_code, error_stage = self.code_extract_retrieve(
                     code_strings)
                 if rows != []:
@@ -830,6 +979,9 @@ class ReactAgent:
                 code_strings = self.prompt_agent_gpt_coder(prompt)
 
             for code_string in code_strings:
+                code_string, _ = self._retry_crt_missing_python_block(
+                    code_string, retry_task_prompt, "retrieve_code_retry",
+                    output_variable="new_table")
                 rows, error, executable_code, error_stage = self.code_extract_retrieve(
                     code_string)
                 if isinstance(rows, list) and rows != []:
@@ -919,13 +1071,15 @@ class ReactAgent:
 
         try:
             eqution = clean_eqution(eqution)
+            # Direct execution is safe only for a single expression.  Prefixing
+            # assignment statements with ``result =`` silently returns the first
+            # assigned value (for example ``a=26; pct=...`` -> 26).
+            ast.parse(eqution, mode="eval")
             loc = {}
-            eqution_ = "result = "+eqution
-            exec(eqution_, globals(), loc)
+            result = eval(compile(eqution, "<crt-calculation>", "eval"), globals(), loc)
             if self.without_tool:
                 return []
             else:
-                result = loc['result']
                 validation_error = self._validate_crt_calculation_result(
                     eqution, result, recent_table_df, input_row_count)
                 if validation_error:
@@ -934,6 +1088,9 @@ class ReactAgent:
                     "Calculate", eqution, "success",
                     result_preview=result,
                     input_row_count=input_row_count,
+                    data_scope=self._infer_crt_data_scope(eqution),
+                    result_artifact=self._build_crt_result_artifact(
+                        eqution, result, input_row_count),
                 )
                 return result
         except Exception:
@@ -1055,6 +1212,35 @@ class ReactAgent:
         max_attempt = self.code_sample
         results, generated_code = [], []
         results2df = defaultdict(list)
+        execution_table_df = self._crt_dataframe_scope_code(table_df)
+        if self.task == "crt":
+            instruction = (
+                f"{instruction}\nCRT calculation scope: df and retrieved_df are the "
+                "latest retrieved rows; full_table_df is the original complete table. "
+                "Use full_table_df for an all-table denominator or population. Store "
+                "the requested final output in final_result."
+            )
+            contract = self._get_crt_answer_contract()
+            if (
+                contract.get("output_kind") in {"ratio", "probability", "percentage"}
+                or (self.question_profile or {}).get("aggregation_operator") == "ratio"
+            ):
+                instruction += (
+                    "\nFor a ratio/probability/percentage, retain numerator and "
+                    "denominator explicitly. Prefer a one-row final_result dataframe "
+                    "with numerator, denominator, unsimplified_pair, quotient, and "
+                    "percentage columns so the final-answer renderer can choose the "
+                    "required representation without recomputing or simplifying it."
+                )
+            if "entity_ranked_by_metric" in getattr(self, "applied_patch_ids", []):
+                instruction += (
+                    "\nFor argmax/argmin, keep both the winning entity and its metric "
+                    "in final_result; the question asks the final agent to return the entity."
+                )
+        retry_task_prompt = (
+            f"Instruction: {instruction}\nDataframe code:\n{execution_table_df}\n"
+            "Assign the requested calculation output to final_result."
+        )
         try:
             input_row_count = self._table_state_row_count(table_df)
         except Exception:
@@ -1065,7 +1251,7 @@ class ReactAgent:
 
         if self.code_model_name == self.plan_model_name:
             prompt = NUMERICAL_OPERATION_PROMPT.format(
-                instruction=instruction, table_df=table_df, examples=NUMERICAL_OPERATION_EXAMPLE)
+                instruction=instruction, table_df=execution_table_df, examples=NUMERICAL_OPERATION_EXAMPLE)
             messages = [{"role": "user", "content": prompt}]
             if self.code_backend == "local":
                 codes = self.llm(
@@ -1073,14 +1259,16 @@ class ReactAgent:
             else:
                 codes = self.prompt_agent_gpt_coder(prompt)
             for code_strings in codes:
+                code_strings, _ = self._retry_crt_missing_python_block(
+                    code_strings, retry_task_prompt, "calculate_code_retry")
                 result, rows, error, extracted_code, error_stage = self.code_extract_calculator(
-                    code_strings, table_df, original_df)
+                    code_strings, execution_table_df, original_df)
                 if self.use_code_repair and error is not None and extracted_code:
                     revised_code = self.revise_code(
-                        error, extracted_code, table_df)
+                        error, extracted_code, execution_table_df)
                     if revised_code:
                         result, rows, repair_error, repaired_code, repair_stage = self.code_extract_calculator(
-                            revised_code, table_df, original_df)
+                            revised_code, execution_table_df, original_df)
                         if repair_error is None:
                             extracted_code = repaired_code
                             error = None
@@ -1089,17 +1277,24 @@ class ReactAgent:
                             error = repair_error
                             error_stage = repair_stage
                 validation_error = "" if error is not None else self._validate_crt_calculation_result(
-                    instruction, result, table_df, input_row_count)
+                    instruction, result,
+                    self._crt_validation_table(table_df, extracted_code),
+                    self._crt_validation_row_count(
+                        input_row_count, extracted_code))
                 if validation_error and self.use_code_repair and extracted_code:
                     revised_code = self.revise_code(
-                        ValueError(validation_error), extracted_code, table_df)
+                        ValueError(validation_error), extracted_code, execution_table_df)
                     if revised_code:
                         result, rows, repair_error, repaired_code, repair_stage = self.code_extract_calculator(
-                            revised_code, table_df, original_df)
+                            revised_code, execution_table_df, original_df)
                         repaired_validation = (
                             "" if repair_error is not None
                             else self._validate_crt_calculation_result(
-                                instruction, result, table_df, input_row_count)
+                                instruction, result,
+                                self._crt_validation_table(
+                                    table_df, repaired_code),
+                                self._crt_validation_row_count(
+                                    input_row_count, repaired_code))
                         )
                         if repair_error is None and not repaired_validation:
                             extracted_code = repaired_code
@@ -1124,6 +1319,10 @@ class ReactAgent:
                         generated_code=extracted_code,
                         result_preview=result,
                         input_row_count=input_row_count,
+                        data_scope=self._infer_crt_data_scope(
+                            instruction, extracted_code),
+                        result_artifact=self._build_crt_result_artifact(
+                            instruction, result, input_row_count, extracted_code),
                     )
                 elif error is not None:
                     self._record_tool_event(
@@ -1163,18 +1362,20 @@ class ReactAgent:
 
             else:
                 prompt = NUMERICAL_OPERATION_PROMPT.format(
-                    instruction=instruction, table_df=table_df, examples=NUMERICAL_OPERATION_EXAMPLE)
+                    instruction=instruction, table_df=execution_table_df, examples=NUMERICAL_OPERATION_EXAMPLE)
                 code_strings = self.prompt_agent_gpt_coder(prompt)
 
             for code_string in code_strings:
+                code_string, _ = self._retry_crt_missing_python_block(
+                    code_string, retry_task_prompt, "calculate_code_retry")
                 result, rows, error, extracted_code, error_stage = self.code_extract_calculator(
-                    code_string, table_df, original_df)
+                    code_string, execution_table_df, original_df)
                 if self.use_code_repair and error is not None and extracted_code:
                     revised_code = self.revise_code(
-                        error, extracted_code, table_df)
+                        error, extracted_code, execution_table_df)
                     if revised_code:
                         result, rows, repair_error, repaired_code, repair_stage = self.code_extract_calculator(
-                            revised_code, table_df, original_df)
+                            revised_code, execution_table_df, original_df)
                         if repair_error is None:
                             extracted_code = repaired_code
                             error = None
@@ -1183,17 +1384,24 @@ class ReactAgent:
                             error = repair_error
                             error_stage = repair_stage
                 validation_error = "" if error is not None else self._validate_crt_calculation_result(
-                    instruction, result, table_df, input_row_count)
+                    instruction, result,
+                    self._crt_validation_table(table_df, extracted_code),
+                    self._crt_validation_row_count(
+                        input_row_count, extracted_code))
                 if validation_error and self.use_code_repair and extracted_code:
                     revised_code = self.revise_code(
-                        ValueError(validation_error), extracted_code, table_df)
+                        ValueError(validation_error), extracted_code, execution_table_df)
                     if revised_code:
                         result, rows, repair_error, repaired_code, repair_stage = self.code_extract_calculator(
-                            revised_code, table_df, original_df)
+                            revised_code, execution_table_df, original_df)
                         repaired_validation = (
                             "" if repair_error is not None
                             else self._validate_crt_calculation_result(
-                                instruction, result, table_df, input_row_count)
+                                instruction, result,
+                                self._crt_validation_table(
+                                    table_df, repaired_code),
+                                self._crt_validation_row_count(
+                                    input_row_count, repaired_code))
                         )
                         if repair_error is None and not repaired_validation:
                             extracted_code = repaired_code
@@ -1218,6 +1426,10 @@ class ReactAgent:
                         generated_code=extracted_code,
                         result_preview=result,
                         input_row_count=input_row_count,
+                        data_scope=self._infer_crt_data_scope(
+                            instruction, extracted_code),
+                        result_artifact=self._build_crt_result_artifact(
+                            instruction, result, input_row_count, extracted_code),
                     )
                 elif error is not None:
                     self._record_tool_event(
@@ -1485,6 +1697,8 @@ class ReactAgent:
         allowed_tools = ["Retrieve", "Calculate", "Search", "Finish"]
         if self.task == "tat":
             allowed_tools = ["Retrieve", "Calculate", "Finish"]
+        elif self.task == "crt":
+            allowed_tools = ["Retrieve", "Calculate", "Finish"]
         elif self.task == "databench":
             allowed_tools = ["Operate", "Finish"]
         allowed_tools = self._filter_disabled_tools(allowed_tools)
@@ -1508,6 +1722,17 @@ class ReactAgent:
             "reasoning_pattern": "Use the original MACT ReAct process and choose tools according to the question.",
             "answer_contract": {},
         }
+
+    def _refresh_crt_patches(self, profile=None):
+        """Match structure-only CRT patches and expose their telemetry."""
+        if self.task != "crt":
+            self.applied_crt_patches = []
+            self.applied_patch_ids = []
+            return []
+        patches = match_crt_patches(self.question, profile or self.question_profile)
+        self.applied_crt_patches = patches
+        self.applied_patch_ids = patch_ids(patches)
+        return patches
 
     def _normalize_question_profile(self, profile):
         default_profile = self._default_question_profile()
@@ -1593,14 +1818,34 @@ class ReactAgent:
             label_type = "open"
 
         words = set(normalized_question.split())
+        output_kind = "text"
+        if allowed_normalized == {"yes", "no"}:
+            output_kind = "yes_no"
+        elif allowed_labels:
+            output_kind = "closed_set"
+        elif re.match(r"^\s*how many\b", lowered):
+            output_kind = "count"
+        elif re.match(r"^\s*(?:who|which)\b", lowered):
+            output_kind = "entity"
+        elif profile.get("answer_shape") == "composite":
+            output_kind = "composite"
+        elif "ratio" in words or "proportion" in words:
+            output_kind = "ratio"
+        elif any(term in words for term in {"percentage", "percent"}):
+            output_kind = "percentage"
+        elif any(term in words for term in {"probability", "likelihood"}):
+            output_kind = "probability"
+        elif any(term in words for term in {"average", "mean", "correlation", "coefficient"}):
+            output_kind = "number"
+
         if profile.get("answer_shape") == "composite":
             representation = "composite"
         elif "ratio" in words:
-            representation = "colon_ratio"
+            representation = "auto_ratio"
         elif any(term in words for term in {"percentage", "percent"}):
-            representation = "percentage"
-        elif "probability" in words:
-            representation = "probability"
+            representation = "auto_percentage"
+        elif any(term in words for term in {"probability", "likelihood"}):
+            representation = "auto_probability"
         elif any(term in words for term in {"average", "mean", "correlation", "coefficient"}):
             representation = "number"
         else:
@@ -1609,20 +1854,58 @@ class ReactAgent:
         precision = None
         if "correlation" in words or "coefficient" in words:
             precision = 4
-        elif "average" in words or "mean" in words:
-            precision = 3
+
+        representation_candidates = {
+            "auto_ratio": ["colon_ratio", "number"],
+            "auto_percentage": ["percentage", "number"],
+            "auto_probability": ["number", "percentage", "fraction"],
+        }.get(representation, [representation])
 
         units = []
         for unit in ["day", "days", "year", "years", "month", "months", "ton", "tons"]:
             if unit in words:
                 units.append(unit)
 
-        return {
+        patches = self._refresh_crt_patches(profile)
+        if not patches:
+            legacy_representation = {
+                "auto_ratio": "colon_ratio",
+                "auto_percentage": "percentage",
+                "auto_probability": "probability",
+            }.get(representation, representation)
+            legacy_precision = precision
+            if legacy_precision is None and (
+                "average" in words or "mean" in words
+            ):
+                legacy_precision = 3
+            # Keep the prompt contract byte-for-byte compatible for questions
+            # outside the targeted registry. This minimizes regressions in the
+            # latest run's already-correct cohort.
+            return {
+                "dataset": "crt",
+                "label_type": label_type,
+                "allowed_labels": allowed_labels,
+                "representation": legacy_representation,
+                "precision": legacy_precision,
+                "units_mentioned": units,
+                "answer_shape": profile.get("answer_shape", "scalar"),
+                "forbidden_labels": [
+                    "supports", "refutes", "not enough info",
+                    "not enough information", "n/a",
+                ],
+            }
+
+        contract = {
             "dataset": "crt",
             "label_type": label_type,
             "allowed_labels": allowed_labels,
+            "output_kind": output_kind,
             "representation": representation,
+            "representation_candidates": representation_candidates,
             "precision": precision,
+            "precision_policy": (
+                "correlation_4" if precision == 4 else "question_template"
+            ),
             "units_mentioned": units,
             "answer_shape": profile.get("answer_shape", "scalar"),
             "forbidden_labels": [
@@ -1630,6 +1913,22 @@ class ReactAgent:
                 "not enough information", "n/a",
             ],
         }
+        contract = apply_contract_overrides(contract, patches)
+        if (
+            contract.get("output_kind") == "relation_label"
+            and not contract.get("allowed_labels")
+        ):
+            relation_labels = []
+            for label, pattern in [
+                ("increase", r"\b(?:increase|increased)\b"),
+                ("decrease", r"\b(?:decrease|decreased)\b"),
+                ("equal", r"\b(?:equal|same)\b"),
+            ]:
+                if re.search(pattern, lowered):
+                    relation_labels.append(label)
+            contract["allowed_labels"] = relation_labels
+            contract["label_type"] = "closed_set" if relation_labels else "open"
+        return contract
 
     def _get_crt_answer_contract(self):
         profile = self.question_profile or self._default_question_profile()
@@ -1654,6 +1953,24 @@ class ReactAgent:
         allowed = contract.get("allowed_labels") or []
         if allowed:
             return normalized in {normalize_answer(value) for value in allowed}
+        output_kind = contract.get("output_kind")
+        if output_kind == "count" and not re.fullmatch(r"-?\d+", text):
+            return False
+        if output_kind == "entity" and re.fullmatch(r"-?\d+(?:\.\d+)?%?", text):
+            return False
+        if output_kind == "range" and not re.match(
+            r"^from\s+.+\s+to\s+.+$", text, flags=re.IGNORECASE
+        ):
+            return False
+        representation = contract.get("representation")
+        if output_kind == "ratio" and representation == "fraction" and not re.fullmatch(
+            r"-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?", text
+        ):
+            return False
+        if output_kind == "ratio" and representation == "colon_ratio" and not re.fullmatch(
+            r"-?\d+(?:\.\d+)?\s*:\s*-?\d+(?:\.\d+)?", text
+        ):
+            return False
         return True
 
     def _normalized_words(self, text):
@@ -1979,6 +2296,8 @@ class ReactAgent:
     def _filter_disabled_tools(self, tools):
         filtered = []
         for tool in tools:
+            if self.task == "crt" and tool == "Search":
+                continue
             if self.disable_search and tool == "Search":
                 continue
             if self.disable_calculate and tool in ["Calculate", "Operate"]:
@@ -2177,6 +2496,11 @@ class ReactAgent:
         control_context = ""
         if self.dataset_hint:
             control_context += self.dataset_hint + "\n"
+        if self.task == "crt":
+            patches = self._refresh_crt_patches(self.question_profile)
+            targeted_hints = patch_prompt_hints(patches)
+            if targeted_hints:
+                control_context += targeted_hints + "\n"
         if self.use_router:
             if self.question_profile is None:
                 self.question_profile = self._default_question_profile()
@@ -2268,6 +2592,83 @@ class ReactAgent:
                     "reason": f"The CRT question requires exactly one of {allowed}.",
                     "suggested_next_action": f"Return exactly one of {allowed} without using a synonym.",
                 }
+            output_kind = contract.get("output_kind", "text")
+            answer_text = str(answer).strip()
+            if output_kind == "count" and not re.fullmatch(r"-?\d+", answer_text):
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": "The CRT question asks how many; the final denotation must be an integer count without a unit or percent sign.",
+                    "suggested_next_action": "Return only the integer count.",
+                }
+            if output_kind == "entity" and re.fullmatch(
+                r"-?\d+(?:\.\d+)?%?", answer_text
+            ):
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": "The ranking metric may be numeric, but this question asks for the winning entity.",
+                    "suggested_next_action": "Return the entity name associated with the extreme metric.",
+                }
+            if output_kind == "range" and not re.match(
+                r"^from\s+.+\s+to\s+.+$", answer_text, flags=re.IGNORECASE
+            ):
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": "The question explicitly requests a From-to range.",
+                    "suggested_next_action": "Return 'From <minimum> to <maximum>'.",
+                }
+            representation = contract.get("representation")
+            if (
+                output_kind == "ratio"
+                and representation == "fraction"
+                and not re.fullmatch(
+                r"-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?", answer_text
+                )
+            ):
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": "This targeted CRT template requires an unsimplified numerator/denominator fraction.",
+                    "suggested_next_action": "Return the two counts using '/'.",
+                }
+            if (
+                output_kind == "ratio"
+                and representation == "colon_ratio"
+                and not re.fullmatch(
+                r"-?\d+(?:\.\d+)?\s*:\s*-?\d+(?:\.\d+)?", answer_text
+                )
+            ):
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": "This targeted CRT template requires a numerator:denominator pair.",
+                    "suggested_next_action": "Return the unsimplified pair using ':'.",
+                }
+            if "table_score_spacing" in getattr(self, "applied_patch_ids", []):
+                try:
+                    loc = {}
+                    exec(self.table_df, globals(), loc)
+                    source_values = {
+                        str(value).strip()
+                        for value in loc["df"].astype(str).to_numpy().ravel()
+                    }
+                except Exception:
+                    source_values = set()
+                compact_answer = re.sub(r"\s+", "", answer_text)
+                exact_score_values = [
+                    value for value in source_values
+                    if re.fullmatch(r"\d+\s+-\s+\d+", value)
+                    and re.sub(r"\s+", "", value) == compact_answer
+                ]
+                if exact_score_values and answer_text not in exact_score_values:
+                    return {
+                        "valid": False,
+                        "error_type": "answer_shape_error",
+                        "reason": "The score matches a table cell only after removing its original spacing.",
+                        "suggested_next_action": f"Copy the table score exactly: {exact_score_values[0]}",
+                    }
         if profile.get("answer_shape") == "composite" and "|" in str(answer):
             return {
                 "valid": False,
@@ -2321,10 +2722,20 @@ class ReactAgent:
         ]
         aggregation_operator = profile.get("aggregation_operator", "none")
         membership_predicate = str(profile.get("membership_predicate", ""))
+        crt_contract = (
+            self._get_crt_answer_contract() if self.task == "crt" else {}
+        )
+        crt_non_numeric_target = (
+            crt_contract.get("label_type") in {"yes_no", "closed_set"}
+            or crt_contract.get("output_kind") in {
+                "yes_no", "closed_set", "entity", "relation_label",
+            }
+        )
         if (
             aggregation_operator == "count"
             and membership_predicate
             and not successful_calculations
+            and not crt_non_numeric_target
         ):
             return {
                 "valid": False,
@@ -2387,6 +2798,15 @@ class ReactAgent:
             self.task != "scitab"
             and aggregation_operator in {"sum", "average", "ratio"}
             and not successful_calculations
+            and not crt_non_numeric_target
+            and not (
+                self.task == "crt"
+                and any(
+                    event.get("tool") == "Search"
+                    and event.get("status") == "success"
+                    for event in self.tool_events
+                )
+            )
         ):
             return {
                 "valid": False,
@@ -2460,7 +2880,14 @@ class ReactAgent:
             event for event in self.tool_events
             if event.get("tool") in {"Retrieve", "Calculate", "Operate", "Search"}
         ]
-        if relevant_events and relevant_events[-1].get("status") == "error":
+        has_successful_relevant_evidence = any(
+            event.get("status") == "success" for event in relevant_events
+        )
+        if (
+            relevant_events
+            and relevant_events[-1].get("status") == "error"
+            and not (self.task == "crt" and has_successful_relevant_evidence)
+        ):
             return {
                 "valid": False,
                 "error_type": "unsupported_answer",
@@ -2760,34 +3187,6 @@ class ReactAgent:
             }
             if normalized in allowed_map:
                 text = allowed_map[normalized]
-            else:
-                # Explicit CRT answer vocabularies are evaluator contracts. Do not
-                # canonicalize them into synonyms such as more -> larger.
-                precision = contract.get("precision")
-                numeric_match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(\.)?", text)
-                if numeric_match:
-                    text = numeric_match.group(1)
-                    if precision is not None and "." in text:
-                        decimals = len(text.rsplit(".", 1)[-1])
-                        if decimals > precision:
-                            text = f"{float(text):.{precision}f}".rstrip("0").rstrip(".")
-
-                # Preserve ratio/fraction notation exactly; only compact score-like
-                # hyphens for other representations.
-                if contract.get("representation") not in {
-                    "colon_ratio", "probability",
-                }:
-                    text = re.sub(r"(?<=\d)\s+-\s+(?=\d)", "-", text)
-
-                question_words = set(self._normalized_words(self.question).split())
-                if not allowed and question_words.intersection({"compare", "compared"}):
-                    relation_map = {
-                        "higher": "larger",
-                        "lower": "smaller",
-                        "equal": "same",
-                        "equals": "same",
-                    }
-                    text = relation_map.get(normalize_answer(text), text)
 
             if text != raw_text:
                 if not hasattr(self, "postprocess_trace"):
@@ -3092,6 +3491,19 @@ class ReactAgent:
                             self.verifier_attempts = getattr(
                                 self, "verifier_attempts", 0) + 1
                             verification = self.verify_finish_answer(final_answer)
+                            if not hasattr(self, "finish_candidate_records"):
+                                self.finish_candidate_records = []
+                            self.finish_candidate_records.append({
+                                "raw_candidate": str(argument).strip(),
+                                "processed_candidate": str(final_answer).strip(),
+                                "verification": verification,
+                                "successful_tool_event_count": sum(
+                                    event.get("status") == "success"
+                                    for event in self.tool_events
+                                ),
+                                "applied_patch_ids": list(
+                                    getattr(self, "applied_patch_ids", [])),
+                            })
                             observation = self._format_verification_observation(
                                 verification, prefix="Final verification")
                             self.scratchpad += f"Observation {self.step_n}: {observation}\n"
@@ -3106,6 +3518,19 @@ class ReactAgent:
                                 if self.task == "crt" and self.verifier_rejections >= 2:
                                     self.actual_step_n = self.max_actual_steps + 1
                         else:
+                            if not hasattr(self, "finish_candidate_records"):
+                                self.finish_candidate_records = []
+                            self.finish_candidate_records.append({
+                                "raw_candidate": str(argument).strip(),
+                                "processed_candidate": str(final_answer).strip(),
+                                "verification": None,
+                                "successful_tool_event_count": sum(
+                                    event.get("status") == "success"
+                                    for event in self.tool_events
+                                ),
+                                "applied_patch_ids": list(
+                                    getattr(self, "applied_patch_ids", [])),
+                            })
                             self.answer = final_answer
                             self.candidate_source = "react_finish"
                             self.finished = True
@@ -3312,12 +3737,21 @@ class ReactAgent:
         return self._is_verification_valid(verification)
 
     def get_crt_direct_fallback_answer(self):
+        successful_evidence = [
+            event for event in self.tool_events
+            if event.get("status") == "success"
+            and event.get("tool") in {"Retrieve", "Calculate", "Operate"}
+        ]
         prompt = CRT_DIRECT_FALLBACK_PROMPT.format(
             table=self.table_string,
             context=self.context,
             question=self.question,
             answer_contract=json.dumps(
                 self._get_crt_answer_contract(), ensure_ascii=False),
+            patch_hints=patch_prompt_hints(
+                self._refresh_crt_patches(self.question_profile)),
+            tool_evidence=json.dumps(
+                successful_evidence[-4:], ensure_ascii=False, default=str),
         )
         output = self._call_plan_llm_once(
             prompt, phase="crt_direct_fallback")
@@ -3337,8 +3771,15 @@ class ReactAgent:
 
     def _get_safe_quick_answer(self):
         if self.task == "crt":
+            existing_answer = self._select_crt_existing_candidate()
+            if existing_answer:
+                self.candidate_source = "preserved_finish_candidate"
+                self.fallback_rejected_reason = ""
+                self.fallback_answer = existing_answer
+                return existing_answer
             try:
                 direct_raw = self.get_crt_direct_fallback_answer()
+                self.direct_answer_candidate = direct_raw
             except Exception as exc:
                 direct_raw = ""
                 self.fallback_rejected_reason = (
@@ -3347,7 +3788,7 @@ class ReactAgent:
             direct_answer = self._postprocess_final_answer(direct_raw)
             if self._is_valid_crt_candidate(direct_answer):
                 answer = direct_answer
-                self.candidate_source = "crt_direct_fallback"
+                self.candidate_source = "crt_evidence_fallback"
                 self.fallback_rejected_reason = ""
             else:
                 answer = self._select_crt_existing_candidate()
@@ -3431,6 +3872,9 @@ class ReactAgent:
         self.verifier_attempts = 0
         self.verifier_rejections = 0
         self.finish_candidates = []
+        self.finish_candidate_records = []
+        self.applied_crt_patches = []
+        self.applied_patch_ids = []
 
     def set_qa(self, question: str, key: str) -> None:
         self.question = question

@@ -61,6 +61,8 @@ def write_to_file(path, agent, idx, new_table_dataset, given_plan):
         )
         item["postprocess_trace"] = agent.postprocess_trace
         item["candidate_source"] = agent.candidate_source
+        item["finish_candidate_records"] = agent.finish_candidate_records
+        item["applied_patch_ids"] = agent.applied_patch_ids
         item["verifier_attempts"] = agent.verifier_attempts
         item["verifier_rejections"] = agent.verifier_rejections
         item["question_profile"] = agent.question_profile

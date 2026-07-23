@@ -6,11 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CODE_ROOT = PROJECT_ROOT / "code"
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
+
+from crt_patches import match_crt_patches, patch_ids  # noqa: E402
 
 from evaluate_wtq_official import (
     check_denotation,
@@ -597,6 +605,59 @@ def _finish_candidates(history: object) -> list[str]:
     )
 
 
+def _format_error_category(prediction: object, gold_answer: object) -> str:
+    """Classify diagnostic-only format equivalences without changing EM."""
+    pred = " | ".join(str(value) for value in prediction_to_items(prediction)).strip()
+    gold = " | ".join(str(value) for value in prediction_to_items(gold_answer)).strip()
+    if not pred or not gold:
+        return "semantic_or_other"
+
+    def numbers(text: str) -> list[float]:
+        return [
+            float(value.replace(",", ""))
+            for value in re.findall(r"-?\d[\d,]*(?:\.\d+)?", text)
+        ]
+
+    pred_numbers = numbers(pred)
+    gold_numbers = numbers(gold)
+    if (
+        pred_numbers
+        and len(pred_numbers) == len(gold_numbers)
+        and all(abs(left - right) < 1e-9
+                for left, right in zip(pred_numbers, gold_numbers))
+    ):
+        return "same_numeric_content_different_format"
+
+    ratio_pattern = re.compile(
+        r"^\s*(-?\d+(?:\.\d+)?)\s*([:/])\s*(-?\d+(?:\.\d+)?)\s*$"
+    )
+    pred_ratio = ratio_pattern.fullmatch(pred)
+    gold_ratio = ratio_pattern.fullmatch(gold)
+    if pred_ratio and gold_ratio:
+        pred_denominator = float(pred_ratio.group(3))
+        gold_denominator = float(gold_ratio.group(3))
+        if (
+            pred_denominator
+            and gold_denominator
+            and abs(
+                float(pred_ratio.group(1)) / pred_denominator
+                - float(gold_ratio.group(1)) / gold_denominator
+            ) < 1e-9
+        ):
+            return "ratio_simplified_or_delimiter"
+
+    scalar_pattern = re.compile(r"^\s*(-?\d+(?:\.(\d+))?)\s*%?\.?\s*$")
+    pred_scalar = scalar_pattern.fullmatch(pred)
+    gold_scalar = scalar_pattern.fullmatch(gold)
+    if pred_scalar and gold_scalar:
+        gold_decimals = len(gold_scalar.group(2) or "")
+        if round(float(pred_scalar.group(1)), gold_decimals) == float(
+            gold_scalar.group(1)
+        ):
+            return "numeric_rounding_only"
+    return "semantic_or_other"
+
+
 def build_replay_metrics(
     results: list[dict],
     annotations: dict[str, Annotation],
@@ -609,12 +670,20 @@ def build_replay_metrics(
     status_counts = defaultdict(lambda: Counter(total=0, correct=0))
     tool_path_counts = defaultdict(lambda: Counter(total=0, correct=0))
     operation_counts = defaultdict(lambda: Counter(total=0, correct=0))
+    patch_counts = defaultdict(
+        lambda: Counter(total=0, correct=0, baseline_correct=0,
+                        wrong_to_right=0, right_to_wrong=0))
+    format_error_counts = Counter()
     accepted_wrong = 0
     rejected_correct = 0
     fallback_overrode_correct = 0
     direct_policy_correct = 0
     direct_policy_evaluated = 0
     raw_available = 0
+    deterministic_correct = 0
+    deterministic_evaluated = 0
+    deterministic_flips = Counter()
+    paired_baseline_flips = Counter()
 
     for item in results:
         if not prediction_to_items(item.get("answer")):
@@ -630,7 +699,20 @@ def build_replay_metrics(
             raw_correct = _denotation_matches(raw_answer, item.get("answer"))
             flips[(bool(raw_correct), bool(current_correct))] += 1
 
+        deterministic_answer = (
+            raw_answer if raw_answer not in (None, "") else item.get("pred_answer")
+        )
         status = str(item.get("run_status") or "unknown")
+        if status.startswith("fallback") and candidates:
+            deterministic_answer = candidates[-1]
+        deterministic_is_correct = _denotation_matches(
+            deterministic_answer, item.get("answer"))
+        deterministic_correct += int(deterministic_is_correct)
+        deterministic_evaluated += 1
+        deterministic_flips[
+            (bool(current_correct), bool(deterministic_is_correct))
+        ] += 1
+
         status_counts[status]["total"] += 1
         status_counts[status]["correct"] += int(current_correct)
         tools = "+".join(dict.fromkeys(
@@ -665,6 +747,28 @@ def build_replay_metrics(
             "Final verification failed."
         )
         baseline_item = baseline_by_id.get(str(item.get("id")))
+        baseline_correct = None
+        if baseline_item is not None:
+            baseline_correct = _denotation_matches(
+                baseline_item.get("pred_answer"), item.get("answer"))
+            paired_baseline_flips[(bool(baseline_correct), bool(current_correct))] += 1
+        current_patch_ids = list(item.get("applied_patch_ids") or [])
+        if not current_patch_ids:
+            current_patch_ids = patch_ids(match_crt_patches(
+                item.get("statement", ""), item.get("question_profile") or {}))
+        for patch_id in current_patch_ids:
+            patch_counts[patch_id]["total"] += 1
+            patch_counts[patch_id]["correct"] += int(current_correct)
+            if baseline_item is not None:
+                patch_counts[patch_id]["baseline_correct"] += int(baseline_correct)
+                patch_counts[patch_id]["wrong_to_right"] += int(
+                    not baseline_correct and current_correct)
+                patch_counts[patch_id]["right_to_wrong"] += int(
+                    baseline_correct and not current_correct)
+        if not current_correct:
+            format_error_counts[_format_error_category(
+                item.get("pred_answer"), item.get("answer"))] += 1
+
         selected_answer = item.get("pred_answer")
         if verifier_failures >= 2 and baseline_item is not None:
             selected_answer = baseline_item.get("pred_answer")
@@ -702,7 +806,33 @@ def build_replay_metrics(
         "by_run_status": summarize_groups(status_counts),
         "by_tool_path": summarize_groups(tool_path_counts),
         "by_operation": summarize_groups(operation_counts),
+        "deterministic_raw_preserve_finish_policy": {
+            "correct": deterministic_correct,
+            "evaluated": deterministic_evaluated,
+            "accuracy": round(
+                deterministic_correct / deterministic_evaluated, 4
+            ) if deterministic_evaluated else 0.0,
+            "wrong_to_right": deterministic_flips[(False, True)],
+            "right_to_wrong": deterministic_flips[(True, False)],
+        },
+        "by_patch": {
+            key: dict(counts) for key, counts in sorted(patch_counts.items())
+        },
+        "format_error_diagnostics": dict(sorted(format_error_counts.items())),
     }
+    paired_evaluated = sum(paired_baseline_flips.values())
+    if paired_evaluated:
+        replay["paired_baseline"] = {
+            "evaluated": paired_evaluated,
+            "both_correct": paired_baseline_flips[(True, True)],
+            "wrong_to_right": paired_baseline_flips[(False, True)],
+            "right_to_wrong": paired_baseline_flips[(True, False)],
+            "both_wrong": paired_baseline_flips[(False, False)],
+            "net_correct_gain": (
+                paired_baseline_flips[(False, True)]
+                - paired_baseline_flips[(True, False)]
+            ),
+        }
     if direct_policy_evaluated:
         replay["direct_after_two_verifier_failures"] = {
             "correct": direct_policy_correct,
@@ -732,6 +862,36 @@ def write_replay_markdown(path: Path, replay: dict) -> None:
             "- Fallbacks overriding the last correct Finish: "
             f"{verifier['fallback_overrode_last_correct_finish']}\n"
         )
+        deterministic = replay["deterministic_raw_preserve_finish_policy"]
+        output_file.write(
+            "- Deterministic raw + preserve-Finish policy: "
+            f"{deterministic['correct']}/{deterministic['evaluated']} "
+            f"({100 * deterministic['accuracy']:.2f}%), "
+            f"wrong→right {deterministic['wrong_to_right']}, "
+            f"right→wrong {deterministic['right_to_wrong']}\n"
+        )
+        output_file.write(
+            "- Format-error diagnostics: "
+            f"`{json.dumps(replay['format_error_diagnostics'], ensure_ascii=False)}`\n"
+        )
+        if replay.get("by_patch"):
+            output_file.write("\n## Patch coverage\n\n")
+            for patch_id, counts in replay["by_patch"].items():
+                output_file.write(
+                    f"- {patch_id}: {counts.get('correct', 0)}/"
+                    f"{counts.get('total', 0)}, wrong→right "
+                    f"{counts.get('wrong_to_right', 0)}, right→wrong "
+                    f"{counts.get('right_to_wrong', 0)}\n"
+                )
+        paired = replay.get("paired_baseline")
+        if paired:
+            output_file.write("\n## Paired baseline\n\n")
+            output_file.write(
+                f"- Evaluated: {paired['evaluated']}\n"
+                f"- wrong→right: {paired['wrong_to_right']}\n"
+                f"- right→wrong: {paired['right_to_wrong']}\n"
+                f"- Net correct gain: {paired['net_correct_gain']}\n"
+            )
         policy = replay.get("direct_after_two_verifier_failures")
         if policy:
             output_file.write(

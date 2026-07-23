@@ -35,10 +35,10 @@ Fixed behavior:
   --use_router
   --use_verifier
   --use_code_repair
-  --postprocess_pred_answer
 
 Not enabled intentionally:
   --direct_reasoning, since this script is for the step-wise MACT flow.
+  --postprocess_pred_answer, since the latest full-set replay was net negative.
 EOF
 }
 
@@ -55,7 +55,6 @@ SUPPLEMENTAL_ARGS=(
   --use_router
   --use_verifier
   --use_code_repair
-  --postprocess_pred_answer
 )
 
 EXTRA_ARGS=()

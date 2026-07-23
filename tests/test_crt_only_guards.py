@@ -22,6 +22,7 @@ def make_crt_agent(question, table=None):
     agent.table_string = table_linear(normalized, num_row=None)
     agent.table_df = table2df(normalized)
     agent.table_dfs = [agent.table_df]
+    agent.df_path = None
     agent.question_profile = None
     agent.tool_events = []
     agent.scratchpad = ""
@@ -43,6 +44,9 @@ def make_crt_agent(question, table=None):
     agent.verifier_attempts = 0
     agent.verifier_rejections = 0
     agent.finish_candidates = []
+    agent.finish_candidate_records = []
+    agent.applied_crt_patches = []
+    agent.applied_patch_ids = []
     agent.without_tool = False
     agent.question_profile = agent._apply_router_guards(
         agent._default_question_profile(), agent.get_literal_header_matches())
@@ -76,21 +80,66 @@ class CrtAnswerContractTest(NoApiTestCase):
         self.assertEqual(agent._postprocess_final_answer("less"), "less")
         self.assertEqual(agent._postprocess_final_answer("equal"), "equal")
 
-    def test_non_explicit_comparison_can_use_crt_canonical_relation(self):
+    def test_non_explicit_comparison_is_not_rewritten_to_a_synonym(self):
         agent = make_crt_agent(
             "How does the total gross of studio A compare to studio B?"
         )
 
-        self.assertEqual(agent._postprocess_final_answer("higher"), "larger")
+        self.assertEqual(agent._postprocess_final_answer("higher"), "higher")
 
-    def test_applies_numeric_precision_without_changing_ratio_shape(self):
+    def test_postprocess_does_not_round_or_change_score_spacing(self):
         average = make_crt_agent("What is the average value?")
         correlation = make_crt_agent("What is the correlation coefficient?")
         ratio = make_crt_agent("What is the ratio of wins to losses?")
+        score = make_crt_agent("What is the most common score?")
 
-        self.assertEqual(average._postprocess_final_answer("1.373626"), "1.374")
-        self.assertEqual(correlation._postprocess_final_answer("0.9775108"), "0.9775")
+        self.assertEqual(average._postprocess_final_answer("1.373626"), "1.373626")
+        self.assertEqual(correlation._postprocess_final_answer("0.9775108"), "0.9775108")
         self.assertEqual(ratio._postprocess_final_answer("3:2"), "3:2")
+        self.assertEqual(score._postprocess_final_answer("1 - 0"), "1 - 0")
+
+    def test_target_aware_contract_patches(self):
+        count = make_crt_agent(
+            "How many teams had a winning percentage greater than 70%?"
+        )
+        entity = make_crt_agent(
+            "Which ground had the highest average crowd attendance?"
+        )
+        direction = make_crt_agent(
+            "Did the average duration decrease or increase over time?"
+        )
+        implicit_binary = make_crt_agent(
+            "Are there any teams with the same score?"
+        )
+        range_agent = make_crt_agent(
+            "What was the range of scores? (From min to max)"
+        )
+
+        self.assertEqual(
+            count.question_profile["answer_contract"]["output_kind"], "count")
+        self.assertIn("count_metric_condition", count.applied_patch_ids)
+        self.assertEqual(
+            entity.question_profile["answer_contract"]["output_kind"], "entity")
+        self.assertIn("entity_ranked_by_metric", entity.applied_patch_ids)
+        self.assertEqual(
+            direction.question_profile["answer_contract"]["allowed_labels"],
+            ["increase", "decrease"],
+        )
+        self.assertEqual(
+            implicit_binary.question_profile["answer_contract"]["allowed_labels"],
+            ["Yes", "No"],
+        )
+        self.assertEqual(
+            range_agent.question_profile["answer_contract"]["output_kind"], "range")
+
+    def test_contract_rejects_metric_when_question_asks_for_entity(self):
+        agent = make_crt_agent(
+            "Which ground had the highest average crowd attendance?"
+        )
+        result = agent._rule_verify_answer("20069.000")
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["error_type"], "answer_shape_error")
 
     def test_crt_verifier_prompt_has_no_scitab_policy(self):
         agent = make_crt_agent(
@@ -127,7 +176,7 @@ class CrtAnswerContractTest(NoApiTestCase):
         self.assertEqual(result, "No")
         self.assertEqual(agent.candidate_source, "preserved_finish_candidate")
 
-    def test_two_rejections_trigger_one_mocked_direct_fallback(self):
+    def test_two_rejections_preserve_finish_without_direct_fallback(self):
         agent = make_crt_agent(
             "How do wins compare? Answer with only 'more', 'less' or 'equal' that is most accurate."
         )
@@ -166,8 +215,22 @@ class CrtAnswerContractTest(NoApiTestCase):
 
         self.assertEqual(agent.verifier_rejections, 2)
         self.assertEqual(agent.verifier_attempts, 2)
-        self.assertEqual(calls, ["direct"])
+        self.assertEqual(calls, [])
         self.assertEqual(agent.answer, "more")
+        self.assertEqual(agent.candidate_source, "preserved_finish_candidate")
+
+    def test_no_finish_candidate_uses_one_mocked_evidence_fallback(self):
+        agent = make_crt_agent("What is the total value?")
+        calls = []
+        agent.get_crt_direct_fallback_answer = (
+            lambda: calls.append("direct") or "1"
+        )
+
+        result = agent._get_safe_quick_answer()
+
+        self.assertEqual(result, "1")
+        self.assertEqual(calls, ["direct"])
+        self.assertEqual(agent.candidate_source, "crt_evidence_fallback")
 
 
 class CrtCalculationGuardTest(NoApiTestCase):
@@ -203,6 +266,60 @@ class CrtCalculationGuardTest(NoApiTestCase):
         self.assertEqual(agent._validate_crt_calculation_result(
             "calculate the correlation coefficient", "0.75", agent.table_df, 2
         ), "")
+
+    def test_assignment_statement_does_not_use_direct_eval_path(self):
+        agent = make_crt_agent("What percentage matches?")
+        calls = []
+        agent.numerical_tool = (
+            lambda instruction, recent, *_args, **_kwargs:
+            calls.append(instruction) or ["3.85%"]
+        )
+
+        result = agent.calculator_tool(
+            "count_total = 26; count_within = 1; "
+            "percentage = (count_within / count_total) * 100",
+            agent.table_df,
+        )
+
+        self.assertEqual(result, ["3.85%"])
+        self.assertEqual(len(calls), 1)
+
+    def test_missing_python_block_retries_once_with_mock(self):
+        agent = make_crt_agent("What is the total?")
+        agent.code_backend = "openai"
+        calls = []
+        agent.prompt_agent_gpt_coder = (
+            lambda prompt, phase:
+            calls.append((prompt, phase)) or ["```python\nfinal_result = '1'\n```"]
+        )
+
+        output, retried = agent._retry_crt_missing_python_block(
+            "The answer is one.", "mock task", "calculate_code_retry")
+
+        self.assertTrue(retried)
+        self.assertIn("final_result", output)
+        self.assertEqual(len(calls), 1)
+
+    def test_crt_calculation_scope_exposes_full_and_retrieved_tables(self):
+        agent = make_crt_agent(
+            "What percentage matches?",
+            [["name", "value"], ["a", "1"], ["b", "2"]],
+        )
+        recent = table2df([["name", "value"], ["a", "1"]])
+
+        scope_code = agent._crt_dataframe_scope_code(recent)
+
+        self.assertIn("retrieved_df = df.copy()", scope_code)
+        self.assertIn("full_table_df = df.copy()", scope_code)
+        self.assertEqual(
+            agent._crt_validation_row_count(1, "result = len(full_table_df)"),
+            2,
+        )
+
+    def test_crt_filters_search_from_allowed_tools(self):
+        agent = make_crt_agent("What is the value?")
+
+        self.assertNotIn("Search", agent.question_profile["allowed_tools"])
 
 
 if __name__ == "__main__":

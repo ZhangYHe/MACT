@@ -177,13 +177,20 @@ Candidate answer: {claim}
 
 CRT_DIRECT_FALLBACK_PROMPT = """Answer this answerable CRT-QA table question independently.
 
-Use only the supplied table and table title. Return only the final denotation, with no reasoning, prefix, explanation, or markdown. Follow the answer contract exactly. Never return supports, refutes, not enough info, or N/A.
+Use only the supplied table, table title, and successful tool evidence. Failed or
+superseded attempts are omitted. Return only the final denotation, with no reasoning,
+prefix, explanation, or markdown. Follow the answer contract and targeted patch hints
+exactly. Never return supports, refutes, not enough info, or N/A.
 
 Table:
 {table}
 Table title: {context}
 Question: {question}
 Answer contract: {answer_contract}
+Targeted patch hints:
+{patch_hints}
+Latest successful tool evidence:
+{tool_evidence}
 Final answer:
 """
 
