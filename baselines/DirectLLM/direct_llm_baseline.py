@@ -44,6 +44,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=int(os.getenv("WORKERS", "4")))
     parser.add_argument("--env_file", default=str(PROJECT_ROOT / ".env"))
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=float(os.getenv("TEMPERATURE", "0.6")),
+        help="Sampling temperature. Defaults to TEMPERATURE or 0.6.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=float(os.getenv("TOP_P", "0.95")),
+        help="Nucleus sampling probability. Defaults to TOP_P or 0.95.",
+    )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=int(os.getenv("MAX_TOKENS", "2000")),
+        help="Maximum completion tokens. Defaults to MAX_TOKENS or 2000.",
+    )
+    parser.add_argument(
+        "--frequency_penalty",
+        type=float,
+        default=float(os.getenv("FREQUENCY_PENALTY", "0")),
+        help="Frequency penalty. Defaults to FREQUENCY_PENALTY or 0.",
+    )
+    parser.add_argument(
+        "--presence_penalty",
+        type=float,
+        default=float(os.getenv("PRESENCE_PENALTY", "0")),
+        help="Presence penalty. Defaults to PRESENCE_PENALTY or 0.",
+    )
+    parser.add_argument(
         "--max_table_chars",
         type=int,
         default=0,
@@ -288,6 +318,11 @@ def call_chat_completion(
     base_url: str,
     model_name: str,
     prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    frequency_penalty: float,
+    presence_penalty: float,
     request_timeout: float,
     max_retries: int,
     request_limiter: RequestStartLimiter | None = None,
@@ -296,7 +331,13 @@ def call_chat_completion(
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "top_p": top_p,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "n": 1,
+        "stop": None,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
@@ -333,6 +374,11 @@ def run_one(
     api_key: str,
     base_url: str,
     model_name: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    frequency_penalty: float,
+    presence_penalty: float,
     max_table_chars: int,
     request_timeout: float,
     max_retries: int,
@@ -340,6 +386,16 @@ def run_one(
 ) -> tuple[int, dict[str, Any]]:
     result = dict(item)
     result["model_name"] = model_name
+    result["temperature"] = temperature
+    result["generation_config"] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "n": 1,
+        "stop": None,
+    }
 
     try:
         table_text, truncated = read_table(item, max_table_chars)
@@ -349,6 +405,11 @@ def run_one(
             base_url=base_url,
             model_name=model_name,
             prompt=prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
             request_timeout=request_timeout,
             max_retries=max_retries,
             request_limiter=request_limiter,
@@ -443,6 +504,22 @@ def main() -> None:
         raise ValueError(f"--max_table_chars must be non-negative, got {args.max_table_chars}")
     if args.request_interval_s < 0:
         raise ValueError(f"--request_interval_s must be non-negative, got {args.request_interval_s}")
+    if not 0 <= args.temperature <= 2:
+        raise ValueError(f"--temperature must be between 0 and 2, got {args.temperature}")
+    if not 0 <= args.top_p <= 1:
+        raise ValueError(f"--top_p must be between 0 and 1, got {args.top_p}")
+    if args.max_tokens <= 0:
+        raise ValueError(f"--max_tokens must be positive, got {args.max_tokens}")
+    if not -2 <= args.frequency_penalty <= 2:
+        raise ValueError(
+            "--frequency_penalty must be between -2 and 2, "
+            f"got {args.frequency_penalty}"
+        )
+    if not -2 <= args.presence_penalty <= 2:
+        raise ValueError(
+            "--presence_penalty must be between -2 and 2, "
+            f"got {args.presence_penalty}"
+        )
 
     env_file = Path(args.env_file).expanduser().resolve()
     dataset_path = Path(args.dataset_path).expanduser().resolve()
@@ -467,7 +544,11 @@ def main() -> None:
 
     print(
         f"Running direct LLM baseline: examples={len(rows)} workers={args.workers} "
-        f"model={model_name} request_interval_s={args.request_interval_s}",
+        f"model={model_name} temperature={args.temperature} "
+        f"top_p={args.top_p} max_tokens={args.max_tokens} "
+        f"frequency_penalty={args.frequency_penalty} "
+        f"presence_penalty={args.presence_penalty} "
+        f"request_interval_s={args.request_interval_s}",
         flush=True,
     )
 
@@ -484,6 +565,11 @@ def main() -> None:
                     api_key=api_key,
                     base_url=base_url,
                     model_name=model_name,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    frequency_penalty=args.frequency_penalty,
+                    presence_penalty=args.presence_penalty,
                     max_table_chars=args.max_table_chars,
                     request_timeout=args.request_timeout,
                     max_retries=args.max_retries,

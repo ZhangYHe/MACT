@@ -20,6 +20,13 @@ RESULT_PATH="${RUN_DIR}/results.jsonl"
 WORKERS="${WORKERS:-15}"
 REQUEST_INTERVAL_S="${REQUEST_INTERVAL_S:-0.7}"
 
+#和主实验一样
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TOP_P="${TOP_P:-0.95}"
+MAX_TOKENS="${MAX_TOKENS:-2000}"
+FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-0}"
+PRESENCE_PENALTY="${PRESENCE_PENALTY:-0}"
+
 if ! [[ "${WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "WORKERS must be a positive integer, got: ${WORKERS}" >&2
   exit 1
@@ -42,6 +49,11 @@ echo "Streaming results to: ${RESULT_PATH}"
 echo "Dataset: ${DATASET_PATH}"
 echo "Model config: ${MODEL_CONFIG}"
 echo "Workers: ${WORKERS}"
+echo "Temperature: ${TEMPERATURE}"
+echo "Top p: ${TOP_P}"
+echo "Max tokens: ${MAX_TOKENS}"
+echo "Frequency penalty: ${FREQUENCY_PENALTY}"
+echo "Presence penalty: ${PRESENCE_PENALTY}"
 echo "Request interval: ${REQUEST_INTERVAL_S}s"
 
 python "${SCRIPT_DIR}/direct_llm_baseline.py" \
@@ -50,6 +62,11 @@ python "${SCRIPT_DIR}/direct_llm_baseline.py" \
   --dataset_path "${DATASET_PATH}" \
   --output_path "${RESULT_PATH}" \
   --workers "${WORKERS}" \
+  --temperature "${TEMPERATURE}" \
+  --top_p "${TOP_P}" \
+  --max_tokens "${MAX_TOKENS}" \
+  --frequency_penalty "${FREQUENCY_PENALTY}" \
+  --presence_penalty "${PRESENCE_PENALTY}" \
   --request_interval_s "${REQUEST_INTERVAL_S}" \
   "$@" 2>&1 | tee "${RUN_DIR}/run.log"
 
