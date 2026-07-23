@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Direct LLM baseline for WikiTableQuestions JSONL files."""
+"""Direct LLM baseline for MACT table-QA JSONL files."""
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
+import io
 import json
 import os
 import re
@@ -21,15 +23,16 @@ from urllib.parse import urlparse
 import yaml
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_PATH = PROJECT_ROOT / "output" / "wtq_test_set.jsonl"
-DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "baselines" / "output" / "direct_llm_results.jsonl"
-DEFAULT_MODEL_CONFIG = PROJECT_ROOT / "config" / "model_configs" / "vllm_qwen3_5_9b.yaml"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
+DEFAULT_DATASET_PATH = PROJECT_ROOT / "output" / "crt_answerable.jsonl"
+DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "output" / "direct_llm_results.jsonl"
+DEFAULT_MODEL_CONFIG = SCRIPT_DIR / "gpt_5.yaml"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a direct LLM WTQ baseline.")
+    parser = argparse.ArgumentParser(description="Run a direct LLM MACT baseline.")
     parser.add_argument("--dataset_path", default=str(DEFAULT_DATASET_PATH))
     parser.add_argument("--output_path", default=str(DEFAULT_OUTPUT_PATH))
     parser.add_argument(
@@ -179,11 +182,53 @@ def read_jsonl(dataset_path: Path, limit: int | None) -> list[dict[str, Any]]:
     return rows
 
 
-def read_table_csv(table_file: str, max_table_chars: int) -> tuple[str, bool]:
-    table_text = Path(table_file).read_text(encoding="utf-8")
+def truncate_table(table_text: str, max_table_chars: int) -> tuple[str, bool]:
     if max_table_chars > 0 and len(table_text) > max_table_chars:
         return table_text[:max_table_chars], True
     return table_text, False
+
+
+def table_rows_to_csv(table_rows: list[object]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    for row_index, row in enumerate(table_rows):
+        if not isinstance(row, (list, tuple)):
+            raise TypeError(
+                f"table_text row {row_index} must be a list or tuple, "
+                f"got {type(row).__name__}"
+            )
+        writer.writerow("" if value is None else value for value in row)
+    return output.getvalue().rstrip("\n")
+
+
+def read_table(item: dict[str, Any], max_table_chars: int) -> tuple[str, bool]:
+    if "table_text" in item:
+        raw_table = item["table_text"]
+        if isinstance(raw_table, str):
+            table_text = raw_table
+        elif isinstance(raw_table, list):
+            table_text = table_rows_to_csv(raw_table)
+        else:
+            raise TypeError(
+                "table_text must be a CSV string or a list of rows, "
+                f"got {type(raw_table).__name__}"
+            )
+    elif item.get("table_file"):
+        table_path = Path(str(item["table_file"])).expanduser()
+        if not table_path.is_absolute():
+            table_path = PROJECT_ROOT / table_path
+        table_text = table_path.read_text(encoding="utf-8")
+    else:
+        raise KeyError("Expected 'table_text' (MACT) or 'table_file' (TableZoomer)")
+
+    return truncate_table(table_text, max_table_chars)
+
+
+def read_question(item: dict[str, Any]) -> str:
+    question = item.get("statement", item.get("question"))
+    if question is None or not str(question).strip():
+        raise KeyError("Expected 'statement' (MACT) or 'question' (TableZoomer)")
+    return str(question).strip()
 
 
 def build_prompt(question: str, table_text: str) -> str:
@@ -297,8 +342,8 @@ def run_one(
     result["model_name"] = model_name
 
     try:
-        table_text, truncated = read_table_csv(str(item["table_file"]), max_table_chars)
-        prompt = build_prompt(str(item["question"]), table_text)
+        table_text, truncated = read_table(item, max_table_chars)
+        prompt = build_prompt(read_question(item), table_text)
         answer = call_chat_completion(
             api_key=api_key,
             base_url=base_url,

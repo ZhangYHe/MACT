@@ -2,19 +2,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 cd "${PROJECT_ROOT}"
 
 if command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
-  conda activate tablezoomer
+  conda activate mact
 fi
 
-# 需要改
-DATASET_PATH="${DATASET_PATH:-output/crt_answerable.jsonl}"
-MODEL_CONFIG="${MODEL_CONFIG:-config/model_configs/gpt_5_4.yaml}"
-RUN_DIR="${RUN_DIR:-baselines/output/gpt_5_4_direct_llm_crt_answerable_$(date +%m%d%H%M)}"
+DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/output/crt_answerable.jsonl}"
+MODEL_CONFIG="${MODEL_CONFIG:-${SCRIPT_DIR}/gpt_5.yaml}"
+RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/output/gpt_5_direct_llm_crt_answerable_$(date +%m%d%H%M)}"
 
 RESULT_PATH="${RUN_DIR}/results.jsonl"
 
@@ -45,8 +44,8 @@ echo "Model config: ${MODEL_CONFIG}"
 echo "Workers: ${WORKERS}"
 echo "Request interval: ${REQUEST_INTERVAL_S}s"
 
-python baselines/direct_llm_baseline.py \
-  --env_file .env \
+python "${SCRIPT_DIR}/direct_llm_baseline.py" \
+  --env_file "${PROJECT_ROOT}/.env" \
   --model_config "${MODEL_CONFIG}" \
   --dataset_path "${DATASET_PATH}" \
   --output_path "${RESULT_PATH}" \

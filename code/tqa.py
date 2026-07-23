@@ -55,6 +55,15 @@ def write_to_file(path, agent, idx, new_table_dataset, given_plan):
         item["parse_failures"] = agent.parse_failures
         item["fallback_answer"] = agent.fallback_answer
         item["fallback_rejected_reason"] = agent.fallback_rejected_reason
+        item["raw_pred_answer"] = agent.raw_pred_answer
+        item["answer_contract"] = (
+            agent._get_crt_answer_contract() if agent.task == "crt" else {}
+        )
+        item["postprocess_trace"] = agent.postprocess_trace
+        item["candidate_source"] = agent.candidate_source
+        item["verifier_attempts"] = agent.verifier_attempts
+        item["verifier_rejections"] = agent.verifier_rejections
+        item["question_profile"] = agent.question_profile
         item["direct_answer_candidate"] = agent.direct_answer_candidate
         item["direct_answer_candidate_verification"] = agent.direct_answer_candidate_verification
         item["table_diagnostics"] = agent.table_diagnostics

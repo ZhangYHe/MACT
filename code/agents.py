@@ -50,7 +50,8 @@ from prompts_table import (DIRECT_AGENT, NUMERICAL_OPERATION_PROMPT,
                            NUMERICAL_OPERATION_PROMPT_LONG_TABLE_GLOBAL,
                            react_agent_prompt_databench, global_plan_prompt,
                            QUESTION_ROUTER_PROMPT, ROUTED_CONTEXT_TEMPLATE,
-                           VERIFY_ACTION_INSTRUCTION, VERIFY_PROMPT)
+                           VERIFY_ACTION_INSTRUCTION, VERIFY_PROMPT,
+                           CRT_VERIFY_PROMPT, CRT_DIRECT_FALLBACK_PROMPT)
 from prompts_table import SCITAB_VERIFY_PROMPT
 from sglang import assistant, function, gen, user
 from tot import llm_reward, vote_prompt_as
@@ -601,55 +602,110 @@ class ReactAgent:
             return False
 
     def _instruction_counts_recent_rows(self, instruction):
-        text = str(instruction).lower()
-        if "count" not in text:
+        text = self._normalized_words(instruction)
+        words = set(text.split())
+        if not words.intersection({"count", "number"}):
             return False
-        grouped_count_terms = [
-            "count each",
-            "count by",
-            "frequency",
-            "frequencies",
-            "unique",
-            "distinct",
-        ]
-        if any(term in text for term in grouped_count_terms):
+        complex_terms = {
+            "average", "mean", "ratio", "proportion", "probability",
+            "percentage", "percent", "difference", "compare", "comparison",
+            "equal", "equals", "frequency", "frequencies", "unique",
+            "distinct", "group", "grouped", "each", "per", "where",
+            "whose", "which", "that", "having", "have", "has", "had",
+            "satisfy", "predicate", "consecutive", "duration", "margin",
+            "more", "less", "above", "below", "between", "and", "or",
+        }
+        if words.intersection(complex_terms):
             return False
-        conditional_count_terms = [
-            "compare",
-            "equal",
-            "where",
-            "whose",
-            "that are",
-            "which are",
-            "satisfy",
-            "predicate",
-            "consecutive",
-        ]
-        if any(term in text for term in conditional_count_terms):
+        if any(term in text for term in ["count by", "count for", "count as"]):
             return False
-        scoped_to_recent = any(
-            term in text
-            for term in [
-                "observation",
-                "recent table",
-                "retrieved",
-                "listed",
-                "matching rows",
-            ]
-        )
-        row_like = any(
-            term in text
-            for term in [
-                "row",
-                "rows",
-                "entry",
-                "entries",
-                "item",
-                "items",
-                "number of",
-            ]
-        )
+        scoped_to_recent = any(term in text for term in [
+            "observation", "recent table", "retrieved table", "retrieved rows",
+            "matching rows", "listed rows",
+        ])
+        row_like = bool(words.intersection({"row", "rows", "entry", "entries"}))
         return scoped_to_recent and row_like
+
+    def _validate_crt_calculation_result(
+        self, instruction, result, recent_table_df, input_row_count
+    ):
+        if self.task != "crt":
+            return ""
+        text = str(result or "").strip()
+        if not text or text.startswith("|"):
+            return ""
+        numeric_match = re.fullmatch(r"-?\d+(?:\.\d+)?", text)
+        if not numeric_match:
+            return ""
+        number = float(text)
+        normalized_instruction = self._normalized_words(instruction)
+        words = set(normalized_instruction.split())
+
+        profile = self.question_profile or self._default_question_profile()
+        if (
+            profile.get("aggregation_operator") == "count"
+            and words.intersection({"count", "number"})
+            and input_row_count is not None
+        ):
+            if number < 0 or (number.is_integer() and number > input_row_count):
+                return (
+                    f"count result {number:g} is outside the valid range "
+                    f"0..{input_row_count} for the current table"
+                )
+            conditional_terms = {
+                "group", "grouped", "each", "where", "whose", "which",
+                "difference", "equal", "ratio", "percentage", "probability",
+                "duration", "consecutive", "above", "below", "more", "less",
+            }
+            if (
+                number.is_integer()
+                and int(number) == int(input_row_count)
+                and words.intersection(conditional_terms)
+            ):
+                return (
+                    "conditional or grouped count collapsed to the complete input "
+                    "row count; apply the predicate explicitly"
+                )
+
+        if words.intersection({"correlation", "coefficient"}) and not -1 <= number <= 1:
+            return f"correlation result {number:g} must be within [-1, 1]"
+        if "absolute" in words and "difference" in words and number < 0:
+            return "absolute difference must be non-negative"
+
+        contract = self._get_crt_answer_contract()
+        representation = contract.get("representation")
+        if representation == "percentage" and not 0 <= number <= 100:
+            return f"percentage result {number:g} must be within [0, 100]"
+        if representation == "probability" and not 0 <= number <= 100:
+            return (
+                f"probability result {number:g} must be within [0, 1] as a "
+                "fraction or [0, 100] as a percentage"
+            )
+
+        if (
+            words.intersection({"average", "mean"})
+            and not words.intersection({"difference", "ratio", "rate", "duration"})
+        ):
+            try:
+                loc = {}
+                if isinstance(recent_table_df, pd.DataFrame):
+                    df = recent_table_df
+                else:
+                    exec(recent_table_df, globals(), loc)
+                    df = loc.get("df")
+                numeric_values = []
+                if isinstance(df, pd.DataFrame):
+                    for column in df.columns:
+                        converted = pd.to_numeric(df[column], errors="coerce").dropna()
+                        numeric_values.extend(converted.astype(float).tolist())
+                if numeric_values and not min(numeric_values) <= number <= max(numeric_values):
+                    return (
+                        f"average result {number:g} is outside the numeric input range "
+                        f"[{min(numeric_values):g}, {max(numeric_values):g}]"
+                    )
+            except Exception:
+                pass
+        return ""
 
     def search_tool(self, query):
         self.last_tool_error = ""
@@ -870,6 +926,10 @@ class ReactAgent:
                 return []
             else:
                 result = loc['result']
+                validation_error = self._validate_crt_calculation_result(
+                    eqution, result, recent_table_df, input_row_count)
+                if validation_error:
+                    raise ValueError(validation_error)
                 self._record_tool_event(
                     "Calculate", eqution, "success",
                     result_preview=result,
@@ -1028,6 +1088,30 @@ class ReactAgent:
                         else:
                             error = repair_error
                             error_stage = repair_stage
+                validation_error = "" if error is not None else self._validate_crt_calculation_result(
+                    instruction, result, table_df, input_row_count)
+                if validation_error and self.use_code_repair and extracted_code:
+                    revised_code = self.revise_code(
+                        ValueError(validation_error), extracted_code, table_df)
+                    if revised_code:
+                        result, rows, repair_error, repaired_code, repair_stage = self.code_extract_calculator(
+                            revised_code, table_df, original_df)
+                        repaired_validation = (
+                            "" if repair_error is not None
+                            else self._validate_crt_calculation_result(
+                                instruction, result, table_df, input_row_count)
+                        )
+                        if repair_error is None and not repaired_validation:
+                            extracted_code = repaired_code
+                            error = None
+                            error_stage = ""
+                            validation_error = ""
+                        else:
+                            validation_error = repaired_validation or str(repair_error)
+                if validation_error:
+                    error = ValueError(validation_error)
+                    error_stage = "result_validation"
+                    result = ""
                 if result != "" and rows != []:
                     try:
                         result = result.strip()
@@ -1098,6 +1182,30 @@ class ReactAgent:
                         else:
                             error = repair_error
                             error_stage = repair_stage
+                validation_error = "" if error is not None else self._validate_crt_calculation_result(
+                    instruction, result, table_df, input_row_count)
+                if validation_error and self.use_code_repair and extracted_code:
+                    revised_code = self.revise_code(
+                        ValueError(validation_error), extracted_code, table_df)
+                    if revised_code:
+                        result, rows, repair_error, repaired_code, repair_stage = self.code_extract_calculator(
+                            revised_code, table_df, original_df)
+                        repaired_validation = (
+                            "" if repair_error is not None
+                            else self._validate_crt_calculation_result(
+                                instruction, result, table_df, input_row_count)
+                        )
+                        if repair_error is None and not repaired_validation:
+                            extracted_code = repaired_code
+                            error = None
+                            error_stage = ""
+                            validation_error = ""
+                        else:
+                            validation_error = repaired_validation or str(repair_error)
+                if validation_error:
+                    error = ValueError(validation_error)
+                    error_stage = "result_validation"
+                    result = ""
                 if result != "" and rows != []:
                     try:
                         result = result.strip()
@@ -1397,7 +1505,8 @@ class ReactAgent:
             "ambiguous": False,
             "ambiguity_reason": "",
             "requires_evidence": False,
-            "reasoning_pattern": "Use the original MACT ReAct process and choose tools according to the question."
+            "reasoning_pattern": "Use the original MACT ReAct process and choose tools according to the question.",
+            "answer_contract": {},
         }
 
     def _normalize_question_profile(self, profile):
@@ -1449,6 +1558,103 @@ class ReactAgent:
         profile["allowed_tools"] = self._filter_disabled_tools(
             profile["allowed_tools"])
         return profile
+
+    def _build_crt_answer_contract(self, profile=None):
+        """Derive evaluator-facing answer constraints from the CRT question."""
+        profile = profile or self.question_profile or {}
+        question = str(self.question or "")
+        normalized_question = self._normalized_words(question)
+        lowered = question.casefold()
+
+        allowed_labels = []
+        explicit_match = re.search(
+            r"answer\s+(?:the\s+[^.?!]*?\s+)?with\s+only\s+(.+?)(?:\s+that\s+is|[.?!]|$)",
+            question,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if explicit_match:
+            allowed_labels = [
+                value.strip()
+                for value in re.findall(r"['\"]([^'\"]+)['\"]", explicit_match.group(1))
+                if value.strip()
+            ]
+        if not allowed_labels and re.search(
+            r"\banswer\b[^.?!]{0,80}\b(?:yes|no)\b[^.?!]{0,30}\b(?:yes|no)\b",
+            lowered,
+        ):
+            allowed_labels = ["Yes", "No"]
+
+        allowed_normalized = {normalize_answer(value) for value in allowed_labels}
+        if allowed_normalized == {"yes", "no"}:
+            label_type = "yes_no"
+        elif allowed_labels:
+            label_type = "closed_set"
+        else:
+            label_type = "open"
+
+        words = set(normalized_question.split())
+        if profile.get("answer_shape") == "composite":
+            representation = "composite"
+        elif "ratio" in words:
+            representation = "colon_ratio"
+        elif any(term in words for term in {"percentage", "percent"}):
+            representation = "percentage"
+        elif "probability" in words:
+            representation = "probability"
+        elif any(term in words for term in {"average", "mean", "correlation", "coefficient"}):
+            representation = "number"
+        else:
+            representation = "text"
+
+        precision = None
+        if "correlation" in words or "coefficient" in words:
+            precision = 4
+        elif "average" in words or "mean" in words:
+            precision = 3
+
+        units = []
+        for unit in ["day", "days", "year", "years", "month", "months", "ton", "tons"]:
+            if unit in words:
+                units.append(unit)
+
+        return {
+            "dataset": "crt",
+            "label_type": label_type,
+            "allowed_labels": allowed_labels,
+            "representation": representation,
+            "precision": precision,
+            "units_mentioned": units,
+            "answer_shape": profile.get("answer_shape", "scalar"),
+            "forbidden_labels": [
+                "supports", "refutes", "not enough info",
+                "not enough information", "n/a",
+            ],
+        }
+
+    def _get_crt_answer_contract(self):
+        profile = self.question_profile or self._default_question_profile()
+        contract = profile.get("answer_contract")
+        if not isinstance(contract, dict) or contract.get("dataset") != "crt":
+            contract = self._build_crt_answer_contract(profile)
+            profile["answer_contract"] = contract
+            self.question_profile = profile
+        return contract
+
+    def _is_valid_crt_candidate(self, answer):
+        text = str(answer or "").strip()
+        if not text or self._is_action_like_answer(text):
+            return False
+        contract = self._get_crt_answer_contract()
+        normalized = normalize_answer(text)
+        forbidden = {
+            normalize_answer(value) for value in contract.get("forbidden_labels", [])
+        }
+        if normalized in forbidden:
+            return False
+        allowed = contract.get("allowed_labels") or []
+        if allowed:
+            return normalized in {normalize_answer(value) for value in allowed}
+        return True
 
     def _normalized_words(self, text):
         return " ".join(re.findall(r"[a-z0-9]+", str(text).lower()))
@@ -1765,6 +1971,9 @@ class ReactAgent:
                 "or values differing by one modifier when the mascot head noun matches."
             )
 
+        if self.task == "crt":
+            profile["answer_contract"] = self._build_crt_answer_contract(profile)
+
         return profile
 
     def _filter_disabled_tools(self, tools):
@@ -1833,6 +2042,13 @@ class ReactAgent:
                     return ""
         if re.match(r"^(?:final\s+)?answer\s*[:：]", text, flags=re.I):
             text = re.split(r"[:：]", text, maxsplit=1)[-1].strip()
+        therefore_match = re.match(
+            r"^therefore,?\s+the\s+answer\s+is\s*[:：]\s*(.*)$",
+            text,
+            flags=re.I | re.DOTALL,
+        )
+        if therefore_match:
+            text = therefore_match.group(1).strip()
         if re.search(r"\b(Thought|Action|Observation)\b", text, flags=re.I):
             return ""
         if re.search(r"\b(Retrieve|Operate|Finish|Search|Calculate|Verify)\s*\[", text):
@@ -1974,6 +2190,10 @@ class ReactAgent:
                 aggregation_operator=self.question_profile["aggregation_operator"],
                 membership_predicate=self.question_profile["membership_predicate"],
                 answer_shape=self.question_profile["answer_shape"],
+                answer_contract=json.dumps(
+                    self.question_profile.get("answer_contract", {}),
+                    ensure_ascii=False,
+                ),
                 composite_columns=self.question_profile["composite_columns"],
                 allowed_tools=self.question_profile["allowed_tools"],
                 ambiguous=self.question_profile["ambiguous"],
@@ -2025,6 +2245,29 @@ class ReactAgent:
                 "suggested_next_action": "Continue reasoning and produce a non-empty answer."
             }
         profile = self.question_profile or self._default_question_profile()
+        if self.task == "crt":
+            contract = self._get_crt_answer_contract()
+            forbidden = {
+                normalize_answer(value)
+                for value in contract.get("forbidden_labels", [])
+            }
+            if normalized_answer in forbidden:
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": "CRT answerable questions require a concrete denotation, not an abstention or SciTab label.",
+                    "suggested_next_action": "Return a concrete answer that follows the CRT answer contract.",
+                }
+            allowed = contract.get("allowed_labels") or []
+            if allowed and normalized_answer not in {
+                normalize_answer(value) for value in allowed
+            }:
+                return {
+                    "valid": False,
+                    "error_type": "answer_shape_error",
+                    "reason": f"The CRT question requires exactly one of {allowed}.",
+                    "suggested_next_action": f"Return exactly one of {allowed} without using a synonym.",
+                }
         if profile.get("answer_shape") == "composite" and "|" in str(answer):
             return {
                 "valid": False,
@@ -2213,14 +2456,15 @@ class ReactAgent:
                         ),
                         "suggested_next_action": "",
                     }
-        latest_tool_status = {}
-        for event in self.tool_events:
-            latest_tool_status[event.get("tool")] = event.get("status")
-        if any(status == "error" for status in latest_tool_status.values()):
+        relevant_events = [
+            event for event in self.tool_events
+            if event.get("tool") in {"Retrieve", "Calculate", "Operate", "Search"}
+        ]
+        if relevant_events and relevant_events[-1].get("status") == "error":
             return {
                 "valid": False,
                 "error_type": "unsupported_answer",
-                "reason": "Recent tool execution failed, so the final claim lacks reliable tool evidence.",
+                "reason": "The latest relevant tool execution failed, so the final claim lacks reliable tool evidence.",
                 "suggested_next_action": "Repair the failed tool action before finishing."
             }
         return None
@@ -2231,19 +2475,28 @@ class ReactAgent:
             return self.verification_cache[cache_key]
         if self.task == "scitab":
             return self._llm_verify_scitab_label(claim, cache_key)
-        prompt = VERIFY_PROMPT.format(
-            question=self.question,
-            context=self.context,
-            table=self.table_string,
-            question_profile=json.dumps(
-                self.question_profile or self._default_question_profile(),
-                ensure_ascii=False,
-            ),
-            tool_events=json.dumps(
-                self.tool_events, ensure_ascii=False, default=str),
-            scratchpad=self.scratchpad,
-            claim=claim
+        profile_json = json.dumps(
+            self.question_profile or self._default_question_profile(),
+            ensure_ascii=False,
         )
+        common_prompt_args = {
+            "question": self.question,
+            "context": self.context,
+            "table": self.table_string,
+            "question_profile": profile_json,
+            "tool_events": json.dumps(
+                self.tool_events, ensure_ascii=False, default=str),
+            "scratchpad": self.scratchpad,
+            "claim": claim,
+        }
+        if self.task == "crt":
+            prompt = CRT_VERIFY_PROMPT.format(
+                **common_prompt_args,
+                answer_contract=json.dumps(
+                    self._get_crt_answer_contract(), ensure_ascii=False),
+            )
+        else:
+            prompt = VERIFY_PROMPT.format(**common_prompt_args)
         try:
             output = self._call_plan_llm_once(prompt, phase="verifier")
             parsed = self._extract_json_object(output)
@@ -2490,10 +2743,60 @@ class ReactAgent:
         return ", ".join(value for _, value in mapped_values)
 
     def _postprocess_final_answer(self, answer):
+        raw_text = str(answer or "").strip()
+        self.raw_pred_answer = raw_text
         if not self.postprocess_pred_answer:
             return answer
-        text = str(answer).strip()
+        text = raw_text
         if not text:
+            return text
+
+        if self.task == "crt":
+            contract = self._get_crt_answer_contract()
+            normalized = normalize_answer(text)
+            allowed = contract.get("allowed_labels") or []
+            allowed_map = {
+                normalize_answer(value): value for value in allowed
+            }
+            if normalized in allowed_map:
+                text = allowed_map[normalized]
+            else:
+                # Explicit CRT answer vocabularies are evaluator contracts. Do not
+                # canonicalize them into synonyms such as more -> larger.
+                precision = contract.get("precision")
+                numeric_match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(\.)?", text)
+                if numeric_match:
+                    text = numeric_match.group(1)
+                    if precision is not None and "." in text:
+                        decimals = len(text.rsplit(".", 1)[-1])
+                        if decimals > precision:
+                            text = f"{float(text):.{precision}f}".rstrip("0").rstrip(".")
+
+                # Preserve ratio/fraction notation exactly; only compact score-like
+                # hyphens for other representations.
+                if contract.get("representation") not in {
+                    "colon_ratio", "probability",
+                }:
+                    text = re.sub(r"(?<=\d)\s+-\s+(?=\d)", "-", text)
+
+                question_words = set(self._normalized_words(self.question).split())
+                if not allowed and question_words.intersection({"compare", "compared"}):
+                    relation_map = {
+                        "higher": "larger",
+                        "lower": "smaller",
+                        "equal": "same",
+                        "equals": "same",
+                    }
+                    text = relation_map.get(normalize_answer(text), text)
+
+            if text != raw_text:
+                if not hasattr(self, "postprocess_trace"):
+                    self.postprocess_trace = []
+                self.postprocess_trace.append({
+                    "raw": raw_text,
+                    "processed": text,
+                    "answer_contract": contract,
+                })
             return text
 
         if self.task == "scitab":
@@ -2606,16 +2909,22 @@ class ReactAgent:
             self.step()
 
         if not self.answer:
-            if self.use_pre_answer:
+            if self.task == "crt" and getattr(self, "verifier_rejections", 0) >= 2:
+                self.answer = self._get_safe_quick_answer()
+                self.finished = bool(self.answer)
+                self.run_status = "fallback_answered"
+            elif self.use_pre_answer:
                 valid_pre_answers = self._valid_pre_answers()
                 if valid_pre_answers:
                     self.answer = self._postprocess_final_answer(
                         Counter(valid_pre_answers).most_common(1)[0][0])
+                    self.candidate_source = "pre_answer"
                     self.finished = True
                     self.run_status = "fallback_answered"
                 elif self.direct_answer_candidate and self._can_use_direct_answer_candidate():
                     self.answer = self._postprocess_final_answer(
                         self.direct_answer_candidate)
+                    self.candidate_source = "parse_recovery"
                     self.fallback_answer = self.answer
                     self.finished = True
                     self.run_status = "fallback_answered"
@@ -2775,8 +3084,13 @@ class ReactAgent:
                         # finish in the action
                         self.scratchpad += thought + "\n"
                         self.scratchpad += action + "\n"
+                        if not hasattr(self, "finish_candidates"):
+                            self.finish_candidates = []
+                        self.finish_candidates.append(str(argument).strip())
                         final_answer = self._postprocess_final_answer(argument)
                         if self.use_verifier:
+                            self.verifier_attempts = getattr(
+                                self, "verifier_attempts", 0) + 1
                             verification = self.verify_finish_answer(final_answer)
                             observation = self._format_verification_observation(
                                 verification, prefix="Final verification")
@@ -2784,11 +3098,16 @@ class ReactAgent:
                             self.step_n += 1
                             if self._is_verification_valid(verification):
                                 self.answer = final_answer
+                                self.candidate_source = "react_finish"
                                 self.finished = True
                             else:
-                                pass
+                                self.verifier_rejections = getattr(
+                                    self, "verifier_rejections", 0) + 1
+                                if self.task == "crt" and self.verifier_rejections >= 2:
+                                    self.actual_step_n = self.max_actual_steps + 1
                         else:
                             self.answer = final_answer
+                            self.candidate_source = "react_finish"
                             self.finished = True
 
                 else:
@@ -2992,7 +3311,51 @@ class ReactAgent:
         self.direct_answer_candidate_verification = verification
         return self._is_verification_valid(verification)
 
+    def get_crt_direct_fallback_answer(self):
+        prompt = CRT_DIRECT_FALLBACK_PROMPT.format(
+            table=self.table_string,
+            context=self.context,
+            question=self.question,
+            answer_contract=json.dumps(
+                self._get_crt_answer_contract(), ensure_ascii=False),
+        )
+        output = self._call_plan_llm_once(
+            prompt, phase="crt_direct_fallback")
+        return self._normalize_direct_answer_candidate(output)
+
+    def _select_crt_existing_candidate(self):
+        candidates = list(reversed(getattr(self, "finish_candidates", [])))
+        candidates.extend([
+            getattr(self, "direct_answer_candidate", ""),
+            getattr(self, "raw_pred_answer", ""),
+        ])
+        for candidate in candidates:
+            processed = self._postprocess_final_answer(candidate)
+            if self._is_valid_crt_candidate(processed):
+                return processed
+        return ""
+
     def _get_safe_quick_answer(self):
+        if self.task == "crt":
+            try:
+                direct_raw = self.get_crt_direct_fallback_answer()
+            except Exception as exc:
+                direct_raw = ""
+                self.fallback_rejected_reason = (
+                    f"crt_direct_fallback_error:{type(exc).__name__}"
+                )
+            direct_answer = self._postprocess_final_answer(direct_raw)
+            if self._is_valid_crt_candidate(direct_answer):
+                answer = direct_answer
+                self.candidate_source = "crt_direct_fallback"
+                self.fallback_rejected_reason = ""
+            else:
+                answer = self._select_crt_existing_candidate()
+                self.candidate_source = "preserved_finish_candidate"
+                self.fallback_rejected_reason = "invalid_direct_fallback"
+            self.fallback_answer = answer
+            return answer
+
         profile = self.question_profile or self._default_question_profile()
         if (
             profile.get("ambiguous")
@@ -3062,6 +3425,12 @@ class ReactAgent:
         self.tool_events = []
         self.last_tool_error = ""
         self.last_verifier_feedback = ""
+        self.raw_pred_answer = ""
+        self.postprocess_trace = []
+        self.candidate_source = ""
+        self.verifier_attempts = 0
+        self.verifier_rejections = 0
+        self.finish_candidates = []
 
     def set_qa(self, question: str, key: str) -> None:
         self.question = question

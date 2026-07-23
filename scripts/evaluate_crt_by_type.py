@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -578,6 +578,169 @@ def write_markdown(path: Path, metrics: dict, result_jsonl: Path, dataset_json: 
         )
 
 
+def _denotation_matches(answer: object, gold_answer: object) -> bool:
+    gold_items = prediction_to_items(gold_answer)
+    predicted_items = prediction_to_items(answer)
+    if not gold_items:
+        return False
+    return check_denotation(
+        to_value_list(gold_items),
+        to_value_list(predicted_items),
+    )
+
+
+def _finish_candidates(history: object) -> list[str]:
+    return re.findall(
+        r"^Action\s+\d+:\s*Finish\[(.*)\]\s*$",
+        str(history or ""),
+        flags=re.MULTILINE,
+    )
+
+
+def build_replay_metrics(
+    results: list[dict],
+    annotations: dict[str, Annotation],
+    baseline_results: list[dict] | None = None,
+) -> dict:
+    baseline_by_id = {
+        str(item.get("id")): item for item in (baseline_results or [])
+    }
+    flips = Counter()
+    status_counts = defaultdict(lambda: Counter(total=0, correct=0))
+    tool_path_counts = defaultdict(lambda: Counter(total=0, correct=0))
+    operation_counts = defaultdict(lambda: Counter(total=0, correct=0))
+    accepted_wrong = 0
+    rejected_correct = 0
+    fallback_overrode_correct = 0
+    direct_policy_correct = 0
+    direct_policy_evaluated = 0
+    raw_available = 0
+
+    for item in results:
+        if not prediction_to_items(item.get("answer")):
+            continue
+        current_correct = _denotation_matches(
+            item.get("pred_answer"), item.get("answer"))
+        candidates = _finish_candidates(item.get("history"))
+        raw_answer = item.get("raw_pred_answer")
+        if raw_answer in (None, "") and candidates:
+            raw_answer = candidates[-1]
+        if raw_answer not in (None, ""):
+            raw_available += 1
+            raw_correct = _denotation_matches(raw_answer, item.get("answer"))
+            flips[(bool(raw_correct), bool(current_correct))] += 1
+
+        status = str(item.get("run_status") or "unknown")
+        status_counts[status]["total"] += 1
+        status_counts[status]["correct"] += int(current_correct)
+        tools = "+".join(dict.fromkeys(
+            str(event.get("tool"))
+            for event in (item.get("tool_events") or [])
+            if event.get("tool")
+        )) or "none"
+        tool_path_counts[tools]["total"] += 1
+        tool_path_counts[tools]["correct"] += int(current_correct)
+        annotation = annotations.get(str(item.get("id")))
+        for operation in (annotation.operations if annotation else []):
+            operation_counts[operation]["total"] += 1
+            operation_counts[operation]["correct"] += int(current_correct)
+
+        if status == "finished" and not current_correct:
+            accepted_wrong += 1
+        any_correct_finish = any(
+            _denotation_matches(candidate, item.get("answer"))
+            for candidate in candidates
+        )
+        if not current_correct and any_correct_finish:
+            rejected_correct += 1
+        if (
+            not current_correct
+            and status.startswith("fallback")
+            and candidates
+            and _denotation_matches(candidates[-1], item.get("answer"))
+        ):
+            fallback_overrode_correct += 1
+
+        verifier_failures = str(item.get("history") or "").count(
+            "Final verification failed."
+        )
+        baseline_item = baseline_by_id.get(str(item.get("id")))
+        selected_answer = item.get("pred_answer")
+        if verifier_failures >= 2 and baseline_item is not None:
+            selected_answer = baseline_item.get("pred_answer")
+        if baseline_item is not None:
+            direct_policy_evaluated += 1
+            direct_policy_correct += int(
+                _denotation_matches(selected_answer, item.get("answer"))
+            )
+
+    def summarize_groups(groups: dict[str, Counter]) -> dict:
+        return {
+            key: {
+                "correct": counts["correct"],
+                "evaluated": counts["total"],
+                "accuracy": round(
+                    counts["correct"] / counts["total"], 4
+                ) if counts["total"] else 0.0,
+            }
+            for key, counts in sorted(groups.items())
+        }
+
+    replay = {
+        "raw_available": raw_available,
+        "raw_to_final_flips": {
+            "wrong_to_right": flips[(False, True)],
+            "right_to_wrong": flips[(True, False)],
+            "right_to_right": flips[(True, True)],
+            "wrong_to_wrong": flips[(False, False)],
+        },
+        "verifier": {
+            "accepted_wrong": accepted_wrong,
+            "wrong_final_with_any_correct_finish": rejected_correct,
+            "fallback_overrode_last_correct_finish": fallback_overrode_correct,
+        },
+        "by_run_status": summarize_groups(status_counts),
+        "by_tool_path": summarize_groups(tool_path_counts),
+        "by_operation": summarize_groups(operation_counts),
+    }
+    if direct_policy_evaluated:
+        replay["direct_after_two_verifier_failures"] = {
+            "correct": direct_policy_correct,
+            "evaluated": direct_policy_evaluated,
+            "accuracy": round(
+                direct_policy_correct / direct_policy_evaluated, 4),
+        }
+    return replay
+
+
+def write_replay_markdown(path: Path, replay: dict) -> None:
+    flips = replay["raw_to_final_flips"]
+    verifier = replay["verifier"]
+    with path.open("w", encoding="utf-8") as output_file:
+        output_file.write("# CRT Candidate Replay Diagnostics\n\n")
+        output_file.write(f"- Raw candidates available: {replay['raw_available']}\n")
+        output_file.write(f"- Raw → final wrong→right: {flips['wrong_to_right']}\n")
+        output_file.write(f"- Raw → final right→wrong: {flips['right_to_wrong']}\n")
+        output_file.write(
+            f"- Verifier accepted wrong finals: {verifier['accepted_wrong']}\n"
+        )
+        output_file.write(
+            "- Wrong finals with a correct Finish candidate: "
+            f"{verifier['wrong_final_with_any_correct_finish']}\n"
+        )
+        output_file.write(
+            "- Fallbacks overriding the last correct Finish: "
+            f"{verifier['fallback_overrode_last_correct_finish']}\n"
+        )
+        policy = replay.get("direct_after_two_verifier_failures")
+        if policy:
+            output_file.write(
+                "- Direct after ≥2 verifier failures: "
+                f"{policy['correct']}/{policy['evaluated']} "
+                f"({100 * policy['accuracy']:.2f}%)\n"
+            )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -598,6 +761,14 @@ def parse_args() -> argparse.Namespace:
         "--output_dir",
         default="",
         help="Output directory. Defaults to the result JSONL parent directory.",
+    )
+    parser.add_argument(
+        "--baseline_result_jsonl",
+        default="",
+        help=(
+            "Optional independent CRT result JSONL used to replay selecting "
+            "Direct after at least two verifier failures."
+        ),
     )
     return parser.parse_args()
 
@@ -625,6 +796,16 @@ def main() -> None:
     write_markdown(markdown_path, metrics, result_jsonl, dataset_json)
     write_jsonl(details_path, details)
 
+    baseline_results = None
+    if args.baseline_result_jsonl:
+        baseline_results = load_results(
+            Path(args.baseline_result_jsonl).expanduser().resolve())
+    replay = build_replay_metrics(results, annotations, baseline_results)
+    replay_path = output_dir / "crt_replay_metrics.json"
+    replay_markdown_path = output_dir / "crt_replay_metrics.md"
+    write_json(replay_path, replay)
+    write_replay_markdown(replay_markdown_path, replay)
+
     denotation = metrics["metrics"]["denotation_em"]["overall"]
     strict = metrics["metrics"]["normalized_string_em"]["overall"]
     print(f"Evaluated {metrics['evaluated']}/{metrics['total_results']} CRT examples")
@@ -633,6 +814,7 @@ def main() -> None:
     print(f"Metrics: {metrics_path}")
     print(f"Markdown: {markdown_path}")
     print(f"Details: {details_path}")
+    print(f"Replay metrics: {replay_path}")
 
 
 if __name__ == "__main__":

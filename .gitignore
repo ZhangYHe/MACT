@@ -6,3 +6,4 @@ output/
 
 tests/*
 !tests/test_evaluate_crt_by_type.py
+!tests/test_crt_only_guards.py

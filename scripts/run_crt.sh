@@ -15,27 +15,27 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [options] [extra tqa.py args]
 
-Runs the mixed 75-example WTQ/CRT/SciTab test file in parallel with per-row
-task routing. Defaults target the GPT-5 OpenAI config.
+Runs the CRT answerable dataset in parallel. Defaults target the GPT-5 config.
 
 Options:
-  --dataset_path PATH  Mixed JSONL path. Default: output/mixed_data_75/mixed_75.jsonl
+  --dataset_path PATH  CRT JSONL path. Default: output/crt_answerable.jsonl
   --model_config PATH  Model config JSON. Default: config/gpt-5.json
-  --workers N          Parallel worker count. Default: WORKERS env or 6
-  --limit N            Global example limit before sharding. Default: RUN_LIMIT env or 6; 0 means all
-  --run_dir PATH       Output run directory. Default: output/runs/mixed_6_gpt-5.4_<timestamp>
+  --workers N          Parallel worker count. Default: WORKERS env or 15
+  --limit N            Global example limit before sharding. Default: RUN_LIMIT env or 0; 0 means all
+  --run_dir PATH       Output run directory. Default: output/runs/crt_<configured-model>_<timestamp>
   -h, --help           Show this help message.
 
 Blocked in this parallel script:
   --task, --output_path
 
 Fixed behavior:
-  --task auto
+  --task crt
   --plan_sample 1
   --code_sample 1
   --use_router
   --use_verifier
   --use_code_repair
+  --postprocess_pred_answer
 
 Not enabled intentionally:
   --direct_reasoning, since this script is for the step-wise MACT flow.
@@ -43,9 +43,10 @@ EOF
 }
 
 WORKERS="${WORKERS:-15}"
-RUN_LIMIT="${RUN_LIMIT:-5}"
-DATASET_PATH="/home/zhangyunhe/nas/code/table/MACT/output/crt_answerable.jsonl"
-RUN_DIR="${PROJECT_ROOT}/output/runs/crt_gpt-5.4_$(date +%Y%m%d_%H%M)"
+RUN_LIMIT="${RUN_LIMIT:-0}"
+DATASET_PATH="${PROJECT_ROOT}/output/crt_answerable.jsonl"
+MODEL_CONFIG="${PROJECT_ROOT}/config/gpt-5.json"
+RUN_DIR=""
 
 PLAN_SAMPLE=1
 CODE_SAMPLE=1
@@ -54,6 +55,7 @@ SUPPLEMENTAL_ARGS=(
   --use_router
   --use_verifier
   --use_code_repair
+  --postprocess_pred_answer
 )
 
 EXTRA_ARGS=()
@@ -125,7 +127,7 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --task|--task=*|--output_path|--output_path=*)
       echo "${1%%=*} is not supported by this parallel script." >&2
-      echo "This script fixes --task auto and writes one output per worker." >&2
+      echo "This script fixes --task crt and writes one output per worker." >&2
       exit 1
       ;;
     *)
@@ -143,13 +145,9 @@ if [[ "${MODEL_CONFIG}" != /* ]]; then
   MODEL_CONFIG="${PROJECT_ROOT}/${MODEL_CONFIG}"
 fi
 
-if [[ "${RUN_DIR}" != /* ]]; then
+if [[ -n "${RUN_DIR}" && "${RUN_DIR}" != /* ]]; then
   RUN_DIR="${PROJECT_ROOT}/${RUN_DIR}"
 fi
-
-RESULT_PATH="${RUN_DIR}/results.jsonl"
-COMMAND_LOG="${RUN_DIR}/run_command.log"
-SHARD_DIR="${RUN_DIR}/shards"
 
 if ! [[ "${WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "WORKERS must be a positive integer, got: ${WORKERS}" >&2
@@ -170,6 +168,25 @@ if [[ ! -f "${MODEL_CONFIG}" ]]; then
   echo "Model config file does not exist: ${MODEL_CONFIG}" >&2
   exit 1
 fi
+
+PLAN_MODEL_NAME=$(python -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as input_file:
+    print(str(json.load(input_file).get("plan_model_name", "")).strip())
+' "${MODEL_CONFIG}")
+if [[ -z "${PLAN_MODEL_NAME}" ]]; then
+  echo "Model config missing required field: plan_model_name" >&2
+  exit 1
+fi
+MODEL_SLUG="${PLAN_MODEL_NAME//\//-}"
+MODEL_SLUG="${MODEL_SLUG// /-}"
+if [[ -z "${RUN_DIR}" ]]; then
+  RUN_DIR="${PROJECT_ROOT}/output/runs/crt_${MODEL_SLUG}_$(date +%Y%m%d_%H%M)"
+fi
+
+RESULT_PATH="${RUN_DIR}/results.jsonl"
+COMMAND_LOG="${RUN_DIR}/run_command.log"
+SHARD_DIR="${RUN_DIR}/shards"
 
 if [[ -e "${RUN_DIR}" ]]; then
   echo "Run directory already exists: ${RUN_DIR}" >&2
@@ -194,23 +211,12 @@ required_fields = [
     ("plan_model_name", "--plan_model_name"),
     ("code_model_name", "--code_model_name"),
 ]
-optional_fields = [
-    ("api_key", "--api_key"),
-    ("base_url", "--base_url"),
-]
-
 for key, flag in required_fields:
     value = str(config.get(key, "")).strip()
     if not value:
         raise SystemExit(f"Model config missing required field: {key}")
     print(flag)
     print(value)
-
-for key, flag in optional_fields:
-    value = str(config.get(key, "")).strip()
-    if value:
-        print(flag)
-        print(value)
 PY
 
 mapfile -t MODEL_CONFIG_ARGS < "${MODEL_CONFIG_ARGS_FILE}"
@@ -327,5 +333,7 @@ done
 
 echo "Saved merged results to ${RESULT_PATH}"
 
-bash "${PROJECT_ROOT}/scripts/evaluate_mixed_results.sh" "${RESULT_PATH}"
-echo "Saved mixed evaluation to ${RUN_DIR}"
+python "${PROJECT_ROOT}/scripts/evaluate_crt_by_type.py" \
+  --result_jsonl "${RESULT_PATH}" \
+  --output_dir "${RUN_DIR}"
+echo "Saved CRT evaluation to ${RUN_DIR}"

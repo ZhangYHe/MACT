@@ -4,7 +4,8 @@ Dataset-specific hints for CRT-QA:
 - CRT-QA often requires combining multiple conditions across rows or columns. Check every stated constraint before finishing.
 - For comparison, ranking, before/after, max/min, or counting questions, preserve the table's row order unless the question explicitly asks for sorted numeric order.
 - If the answer has multiple values, return them as structured separate items or a simple separator form. Use a separator only when the question asks for multiple values. If the answer is one combination made from multiple fields, return one compact string in table-evidence order.
-- For average, ratio, and percentage questions, if the question does not specify precision, finish with a concise rounded answer, usually two decimal places. Do not expose long floating-point artifacts.
+- Preserve any explicit final-answer vocabulary in the question exactly. For example, if the question requires only more, less, or equal, do not replace those labels with larger, smaller, or same.
+- For averages, use three decimal places and remove trailing zeros unless the question specifies another precision. For correlation coefficients, use four decimal places. Preserve the requested percentage, fraction, or colon-ratio representation instead of converting between them.
 - For win-loss records, scores, and other hyphenated numeric records, preserve the compact table-style form such as 1-7, not 1 - 7.
 - For compare/how do X compare questions, finish with the requested relationship or compact conclusion such as larger, smaller, same, higher, or lower. Do not finish with a long evidence list unless the question asks to list evidence.
 - For same men's and women's nickname questions, remove gender markers such as "lady" first. If the remaining values differ only by one modifier but share the same mascot head noun, treat them as the same core nickname unless exact equality is requested.

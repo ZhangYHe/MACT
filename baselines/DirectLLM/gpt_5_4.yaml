@@ -1,0 +1,4 @@
+llm:
+  model: "gpt-5.4"
+  base_url_env: "OPENAI_BASE_URL"
+  api_key_env: "OPENAI_API_KEY"

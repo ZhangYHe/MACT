@@ -137,6 +137,57 @@ Claim to verify: {claim}
 """
 
 
+CRT_VERIFY_PROMPT = """You are verifying a candidate answer for an answerable CRT-QA table question.
+
+Judge whether the candidate directly answers the question and is supported by the table, title, and successful tool evidence. Check the intended columns, every filter and grouping constraint, the required calculation, and the supplied answer contract. A candidate merely appearing in the table or reasoning history is not sufficient.
+
+CRT-specific policy:
+- Every question is answerable from the supplied table and title. Never request or return supports, refutes, not enough info, or N/A.
+- If answer_contract.allowed_labels is non-empty, the candidate must use exactly one of those labels. Do not replace an explicitly requested label with a synonym.
+- A numeric answer must preserve the representation requested by the contract: number, percentage, fraction, or colon ratio.
+- A compact final answer must contain only the denotation, without an explanation or evidence list.
+- Failed older tool attempts do not invalidate a later successful calculation. Judge the latest relevant successful evidence.
+
+Return only a JSON object with these keys:
+{{
+  "valid": true,
+  "error_type": "none",
+  "reason": "...",
+  "suggested_next_action": "..."
+}}
+
+If the candidate is not supported, set valid to false and choose one error_type from:
+empty_result, missing_constraint, wrong_operation, unsupported_answer, answer_shape_error, unclear.
+
+Question: {question}
+Table title: {context}
+Table:
+{table}
+Question routing profile:
+{question_profile}
+Answer contract:
+{answer_contract}
+Tool execution records:
+{tool_events}
+Reasoning history:
+{scratchpad}
+Candidate answer: {claim}
+"""
+
+
+CRT_DIRECT_FALLBACK_PROMPT = """Answer this answerable CRT-QA table question independently.
+
+Use only the supplied table and table title. Return only the final denotation, with no reasoning, prefix, explanation, or markdown. Follow the answer contract exactly. Never return supports, refutes, not enough info, or N/A.
+
+Table:
+{table}
+Table title: {context}
+Question: {question}
+Answer contract: {answer_contract}
+Final answer:
+"""
+
+
 SCITAB_VERIFY_PROMPT = """You are independently classifying the relationship between a scientific claim and one table plus its caption.
 
 Do not evaluate or defend a previously proposed label. Determine the evidence relation from scratch.
@@ -192,6 +243,7 @@ ROUTED_CONTEXT_TEMPLATE = """Question routing profile:
 - aggregation_operator: {aggregation_operator}
 - membership_predicate: {membership_predicate}
 - answer_shape: {answer_shape}
+- answer_contract: {answer_contract}
 - composite_columns: {composite_columns}
 - allowed_tools: {allowed_tools}
 - ambiguous: {ambiguous}

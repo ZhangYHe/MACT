@@ -14,6 +14,7 @@ from evaluate_crt_by_type import (  # noqa: E402
     DIRECTNESS_TYPES,
     OPERATION_TYPES,
     REASONING_TYPES,
+    build_replay_metrics,
     evaluate_result_rows,
     load_annotations,
     normalized_string_match,
@@ -52,6 +53,42 @@ class NormalizedStringEmTest(unittest.TestCase):
         self.assertFalse(normalized_string_match(["Netherlands"], ["Netherlands (NED)"]))
         self.assertFalse(normalized_string_match(["1-7"], ["1–7"]))
         self.assertFalse(normalized_string_match(["a", "b"], ["b", "a"]))
+
+
+class ReplayDiagnosticsTest(unittest.TestCase):
+    def test_reports_verifier_and_direct_fallback_counterfactuals(self):
+        example_id = "crt:answerable:table.csv:0"
+        annotations = {
+            example_id: type("AnnotationStub", (), {
+                "operations": frozenset({"Group"}),
+            })()
+        }
+        results = [{
+            "id": example_id,
+            "answer": ["more"],
+            "pred_answer": "larger",
+            "run_status": "fallback_answered",
+            "history": (
+                "Action 1: Finish[more]\n"
+                "Observation 1: Final verification failed.\n"
+                "Action 2: Finish[more]\n"
+                "Observation 2: Final verification failed.\n"
+            ),
+            "tool_events": [{"tool": "Calculate", "status": "success"}],
+        }]
+        baseline = [{
+            "id": example_id,
+            "answer": ["more"],
+            "pred_answer": "more",
+        }]
+
+        replay = build_replay_metrics(results, annotations, baseline)
+
+        self.assertEqual(replay["raw_to_final_flips"]["right_to_wrong"], 1)
+        self.assertEqual(
+            replay["verifier"]["fallback_overrode_last_correct_finish"], 1)
+        self.assertEqual(
+            replay["direct_after_two_verifier_failures"]["correct"], 1)
 
 
 class AnnotationLoadingTest(unittest.TestCase):
